@@ -1,0 +1,3 @@
+module Order = struct
+    type t = Less | More;
+end
