@@ -12,14 +12,14 @@ enum Op {
     Minus,
     // *
     Product,
-    // ||
-    Or,
     // <
     Less,
     // >
     Greater,
     // ==
     Equal,
+    // ||
+    Or,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -93,7 +93,8 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     });
     let marked = just('\'').ignore_then(alphabetic).map(Token::TypeParameter);
 
-    let op = just('<').to(Token::Op(Op::Less))
+    let op = just('<')
+        .to(Token::Op(Op::Less))
         .or(just('>').to(Token::Op(Op::Greater)))
         .or(just("==").to(Token::Op(Op::Equal)))
         .or(just("||").to(Token::Op(Op::Or)))
@@ -146,18 +147,40 @@ enum Expr {
     List(Vec<Expr>),
     Tuple(Vec<Expr>),
     // Complex
-    App(Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     BinOp(BinOp, Box<Expr>, Box<Expr>),
+    App(Box<Expr>, Box<Expr>),
 }
 
 impl Expr {
+    fn ident(name: &str) -> Self {
+        Expr::Ident(name.to_owned())
+    }
+
     fn app(f: Self, x: Self) -> Self {
         Self::App(Box::new(f), Box::new(x))
     }
 
-    fn unary(_op: Token, x: Self) -> Self {
-        Self::Unary(UnOp::Negative, Box::new(x))
+    fn make_unary(_op: Token, x: Self) -> Self {
+        Self::unary_with(UnOp::Negative, x)
+    }
+
+    fn unary_with(op: UnOp, x: Self) -> Self {
+        Self::Unary(op, Box::new(x))
+    }
+
+    fn make_binop(op: Token, x: Self, y: Self) -> Self {
+        let binop = match op {
+            Token::Op(Op::Minus) => BinOp::Sub,
+            Token::Op(Op::Plus) => BinOp::Sum,
+            Token::Op(Op::Product) => BinOp::Product,
+            _ => todo!(),
+        };
+        Self::binop_with(binop, x, y)
+    }
+
+    fn binop_with(op: BinOp, x: Self, y: Self) -> Self {
+        Self::BinOp(op, Box::new(x), Box::new(y))
     }
 }
 
@@ -197,15 +220,39 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
         });
 
         let term = group.or(list);
+        // Parse operators
+        // 0) unary
+        // 1) *
+        // 2) +, -
+        // 3) <, >
+        // 4) ==
+        // 5) ||
         let unary = just(Token::Op(Op::Minus))
             .repeated()
             .then(term.clone())
-            .foldr(Expr::unary);
+            .foldr(Expr::make_unary);
+        let product = unary
+            .clone()
+            .then(just(Token::Op(Op::Product)).then(unary.clone()).repeated())
+            .foldl(|x, (op, y)| Expr::make_binop(op, x, y));
 
-        let app = term.clone().then(term.clone().repeated()).foldl(Expr::app);
-        let complex = app;
+        let sum = product
+            .clone()
+            .then(
+                just(Token::Op(Op::Plus))
+                    .or(just(Token::Op(Op::Minus)))
+                    .then(product.clone())
+                    .repeated(),
+            )
+            .foldl(|x, (op, y)| Expr::make_binop(op, x, y));
 
-        complex
+        let arithmetic = sum;
+
+        let app = arithmetic
+            .clone()
+            .then(term.clone().repeated())
+            .foldl(Expr::app);
+        app
     })
     .map_with_span(|expr, span| (expr, span))
     .then_ignore(end())
@@ -247,7 +294,7 @@ mod tests {
     #[test]
     fn parse_ident_expr() {
         let src = "zero";
-        assert_eq!(parse_expr(src), Ok(Expr::Ident("zero".to_owned())))
+        assert_eq!(parse_expr(src), Ok(Expr::ident("zero")))
     }
 
     #[test]
@@ -309,9 +356,37 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::Tuple(vec![
-                Expr::Ident("zero".to_owned()),
+                Expr::ident("zero"),
                 Expr::Int(5),
-                Expr::Ident("next".to_owned()),
+                Expr::ident("next"),
+            ])),
+        )
+    }
+
+    #[test]
+    fn parse_tuple_nested_expr() {
+        let src = "(zero, (1, 2), 5, next)";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::Tuple(vec![
+                Expr::ident("zero"),
+                Expr::Tuple(vec![Expr::Int(1), Expr::Int(2)]),
+                Expr::Int(5),
+                Expr::ident("next"),
+            ])),
+        )
+    }
+
+    #[test]
+    fn parse_tuple_nested_call_expr() {
+        let src = "(zero, (1, 2), (next 4), next)";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::Tuple(vec![
+                Expr::ident("zero"),
+                Expr::Tuple(vec![Expr::Int(1), Expr::Int(2)]),
+                Expr::app(Expr::ident("next"), Expr::Int(4)),
+                Expr::ident("next"),
             ])),
         )
     }
@@ -336,7 +411,7 @@ mod tests {
 
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::List(vec![Expr::Int(5), Expr::Int(25),]))
+            Ok(Expr::List(vec![Expr::Int(5), Expr::Int(25)]))
         )
     }
 
@@ -365,7 +440,7 @@ mod tests {
         let src = "next 25";
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::app(Expr::Ident("next".to_owned()), Expr::Int(25))),
+            Ok(Expr::app(Expr::ident("next"), Expr::Int(25))),
         );
     }
 
@@ -374,7 +449,7 @@ mod tests {
         let src = "(next 25)";
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::app(Expr::Ident("next".to_owned()), Expr::Int(25))),
+            Ok(Expr::app(Expr::ident("next"), Expr::Int(25))),
         )
     }
 
@@ -385,14 +460,14 @@ mod tests {
             parse_expr(src),
             Ok(Expr::List(vec![
                 Expr::Int(5),
-                Expr::Ident("zero".to_owned()),
-                Expr::app(Expr::Ident("next".to_owned()), Expr::Int(25)),
+                Expr::ident("zero"),
+                Expr::app(Expr::ident("next"), Expr::Int(25)),
             ]))
         )
     }
 
     #[test]
-    fn parse_nested_list() {
+    fn parse_list_nested_expr() {
         let src = "[[5 5] [5 5]]";
         assert_eq!(
             parse_expr(src),
@@ -411,7 +486,7 @@ mod tests {
             Ok(Expr::List(vec![
                 Expr::Int(5),
                 Expr::app(
-                    Expr::Ident("sum".to_owned()),
+                    Expr::ident("sum"),
                     Expr::List(vec![Expr::Int(5), Expr::Int(5)])
                 ),
             ]))
@@ -424,11 +499,11 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::app(
-                Expr::Ident("sum".to_owned()),
+                Expr::ident("sum"),
                 Expr::List(vec![
                     Expr::Int(5),
                     Expr::app(
-                        Expr::Ident("sum".to_owned()),
+                        Expr::ident("sum"),
                         Expr::List(vec![Expr::Int(5), Expr::Int(5)])
                     ),
                 ])
@@ -438,7 +513,7 @@ mod tests {
 
     #[test]
     fn tokenize_arithmetic_expr() {
-        let src = "- x + y * z + y";
+        let src = "-x + y * z + y";
         assert_eq!(
             remove_spans(lexer().parse(src)),
             Ok(vec![
@@ -452,6 +527,106 @@ mod tests {
                 Token::Ident("y".to_owned()),
             ])
         );
+    }
+
+    #[test]
+    fn parse_neg_expr() {
+        let src = "-x";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::unary_with(UnOp::Negative, Expr::ident("x"),))
+        )
+    }
+
+    #[test]
+    fn parse_neg_duplicated_expr() {
+        let src = "- - -x";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::unary_with(
+                UnOp::Negative,
+                Expr::unary_with(
+                    UnOp::Negative,
+                    Expr::unary_with(UnOp::Negative, Expr::ident("x"),),
+                ),
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_product_expr() {
+        let src = "x * 5";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Product,
+                Expr::ident("x"),
+                Expr::Int(5),
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_sum_expr() {
+        let src = "5 + x";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(BinOp::Sum, Expr::Int(5), Expr::ident("x")))
+        )
+    }
+
+    #[test]
+    fn parse_sub_expr() {
+        let src = "5 - x";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(BinOp::Sub, Expr::Int(5), Expr::ident("x")))
+        )
+    }
+
+    #[test]
+    fn parse_arithmetic_expr() {
+        let src = "-x + y * z + y";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Sum,
+                Expr::binop_with(
+                    BinOp::Sum,
+                    Expr::unary_with(UnOp::Negative, Expr::ident("x")),
+                    Expr::binop_with(
+                        BinOp::Product,
+                        Expr::ident("y"),
+                        Expr::ident("z"),
+                    )
+                ),
+                Expr::ident("y"),
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_arithmetic_in_list_expr() {
+        let src = "[(-x + y * z + y) (x + 5)]";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::List(vec![
+                Expr::binop_with(
+                    BinOp::Sum,
+                    Expr::binop_with(
+                        BinOp::Sum,
+                        Expr::unary_with(UnOp::Negative, Expr::ident("x")),
+                        Expr::binop_with(
+                            BinOp::Product,
+                            Expr::ident("y"),
+                            Expr::ident("z"),
+                        )
+                    ),
+                    Expr::ident("y"),
+                ),
+                Expr::binop_with(BinOp::Sum, Expr::ident("x"), Expr::Int(5)),
+            ]))
+        )
     }
 
     #[test]
