@@ -5,6 +5,24 @@ use chumsky::prelude::*;
 type Span = std::ops::Range<usize>;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+enum Op {
+    // +
+    Plus,
+    // -
+    Minus,
+    // *
+    Product,
+    // ||
+    Or,
+    // <
+    Less,
+    // >
+    Greater,
+    // ==
+    Equal,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 enum Token {
     // Words
     Int(String),
@@ -12,7 +30,7 @@ enum Token {
     Ident(String),
     TypeParameter(String),
     // Operators
-    BinOp(String),
+    Op(Op),
     // Declarators
     Let,
     Type,
@@ -26,7 +44,7 @@ enum Token {
     MatchArrow,
     // Binders
     Of,
-    Equal,
+    Is,
     In,
     // Finishers
     SemiColon,
@@ -75,19 +93,20 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     });
     let marked = just('\'').ignore_then(alphabetic).map(Token::TypeParameter);
 
-    let onechar_op = just('<')
-        .or(just('>'))
-        .map(|op| Token::BinOp(op.to_string()));
-    let multichar_op = just("||").map(|op| Token::BinOp(op.to_owned()));
-    let op = onechar_op.or(multichar_op);
+    let op = just('<').to(Token::Op(Op::Less))
+        .or(just('>').to(Token::Op(Op::Greater)))
+        .or(just("==").to(Token::Op(Op::Equal)))
+        .or(just("||").to(Token::Op(Op::Or)))
+        .or(just('+').to(Token::Op(Op::Plus)))
+        .or(just('-').to(Token::Op(Op::Minus)))
+        .or(just('*').to(Token::Op(Op::Product)));
 
     let ctrl = just("=>")
         .to(Token::MatchArrow)
-        .or(just('=').to(Token::Equal))
+        .or(just('=').to(Token::Is))
         .or(just(';').to(Token::SemiColon))
         .or(just(',').to(Token::Comma))
         .or(just('|').to(Token::Either))
-        .or(just('*').to(Token::Product))
         .or(just('(').to(Token::OpenParen))
         .or(just(')').to(Token::CloseParen))
         .or(just('[').to(Token::OpenBracket))
@@ -106,6 +125,18 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+enum UnOp {
+    Negative,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum BinOp {
+    Sum,
+    Sub,
+    Product,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 enum Expr {
     // Atoms
     Int(u64),
@@ -116,11 +147,17 @@ enum Expr {
     Tuple(Vec<Expr>),
     // Complex
     App(Box<Expr>, Box<Expr>),
+    Unary(UnOp, Box<Expr>),
+    BinOp(BinOp, Box<Expr>, Box<Expr>),
 }
 
 impl Expr {
     fn app(f: Self, x: Self) -> Self {
         Self::App(Box::new(f), Box::new(x))
+    }
+
+    fn unary(_op: Token, x: Self) -> Self {
+        Self::Unary(UnOp::Negative, Box::new(x))
     }
 }
 
@@ -132,9 +169,9 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
             Token::Str(s) => Expr::Str(s),
         };
 
-        let enclosed = expr
+        let enclosed = atom.or(expr
             .clone()
-            .delimited_by(just(Token::OpenParen), just(Token::CloseParen));
+            .delimited_by(just(Token::OpenParen), just(Token::CloseParen)));
 
         let tuple = expr
             .clone()
@@ -143,7 +180,7 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
             .collect::<Vec<_>>()
             .map(Expr::Tuple);
 
-        let group = atom.or(enclosed).or(tuple);
+        let group = enclosed.or(tuple);
 
         let list = recursive(|sublist| {
             let element = group.clone().or(sublist.clone());
@@ -151,15 +188,22 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
             element
                 .clone()
                 .repeated()
-                .delimited_by(just(Token::OpenBracket), just(Token::CloseBracket))
+                .delimited_by(
+                    just(Token::OpenBracket),
+                    just(Token::CloseBracket),
+                )
                 .collect::<Vec<_>>()
                 .map(Expr::List)
         });
 
         let term = group.or(list);
+        let unary = just(Token::Op(Op::Minus))
+            .repeated()
+            .then(term.clone())
+            .foldr(Expr::unary);
 
-        let call = term.clone().then(term.clone().repeated()).foldl(Expr::app);
-        let complex = call;
+        let app = term.clone().then(term.clone().repeated()).foldl(Expr::app);
+        let complex = app;
 
         complex
     })
@@ -393,17 +437,35 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_binop_expr() {
+    fn tokenize_arithmetic_expr() {
+        let src = "- x + y * z + y";
+        assert_eq!(
+            remove_spans(lexer().parse(src)),
+            Ok(vec![
+                Token::Op(Op::Minus),
+                Token::Ident("x".to_owned()),
+                Token::Op(Op::Plus),
+                Token::Ident("y".to_owned()),
+                Token::Op(Op::Product),
+                Token::Ident("z".to_owned()),
+                Token::Op(Op::Plus),
+                Token::Ident("y".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_logic_expr() {
         let src = "x < y || z > y";
         assert_eq!(
             remove_spans(lexer().parse(src)),
             Ok(vec![
                 Token::Ident("x".to_owned()),
-                Token::BinOp("<".to_owned()),
+                Token::Op(Op::Less),
                 Token::Ident("y".to_owned()),
-                Token::BinOp("||".to_owned()),
+                Token::Op(Op::Or),
                 Token::Ident("z".to_owned()),
-                Token::BinOp(">".to_owned()),
+                Token::Op(Op::Greater),
                 Token::Ident("y".to_owned()),
             ])
         );
@@ -417,7 +479,7 @@ mod tests {
             Ok(vec![
                 Token::If,
                 Token::Ident("x".to_owned()),
-                Token::BinOp("<".to_owned()),
+                Token::Op(Op::Less),
                 Token::Ident("y".to_owned()),
                 Token::Then,
                 Token::Int("0".to_owned()),
@@ -457,7 +519,7 @@ mod tests {
             Ok(vec![
                 Token::Let,
                 Token::Ident("x".to_owned()),
-                Token::Equal,
+                Token::Is,
                 Token::Int("5".to_owned()),
                 Token::In,
                 Token::Ident("Some".to_owned()),
@@ -474,7 +536,7 @@ mod tests {
             Ok(vec![
                 Token::Let,
                 Token::Ident("x".to_owned()),
-                Token::Equal,
+                Token::Is,
                 Token::Int("50".to_owned()),
                 Token::SemiColon,
             ])
@@ -490,7 +552,7 @@ mod tests {
                 Token::Type,
                 Token::TypeParameter("a".to_owned()),
                 Token::Ident("option".to_owned()),
-                Token::Equal,
+                Token::Is,
                 Token::Ident("Some".to_owned()),
                 Token::Of,
                 Token::TypeParameter("a".to_owned()),
@@ -510,13 +572,13 @@ mod tests {
                 Token::Type,
                 Token::TypeParameter("a".to_owned()),
                 Token::Ident("list".to_owned()),
-                Token::Equal,
+                Token::Is,
                 Token::Ident("Nil".to_owned()),
                 Token::Either,
                 Token::Ident("Cons".to_owned()),
                 Token::Of,
                 Token::TypeParameter("a".to_owned()),
-                Token::Product,
+                Token::Op(Op::Product),
                 Token::TypeParameter("a".to_owned()),
                 Token::Ident("list".to_owned()),
                 Token::SemiColon,
@@ -532,9 +594,9 @@ mod tests {
             Ok(vec![
                 Token::Type,
                 Token::Ident("point".to_owned()),
-                Token::Equal,
+                Token::Is,
                 Token::Ident("int".to_owned()),
-                Token::Product,
+                Token::Op(Op::Product),
                 Token::Ident("int".to_owned()),
                 Token::SemiColon,
             ])
@@ -549,7 +611,7 @@ mod tests {
             Ok(vec![
                 Token::Type,
                 Token::Ident("date".to_owned()),
-                Token::Equal,
+                Token::Is,
                 Token::OpenBrace,
                 Token::Ident("year".to_owned()),
                 Token::Of,
@@ -583,13 +645,13 @@ end
                 // module declaration
                 Token::Module,
                 Token::Ident("Option".to_owned()),
-                Token::Equal,
+                Token::Is,
                 Token::Struct,
                 // type declaration
                 Token::Type,
                 Token::TypeParameter("a".to_owned()),
                 Token::Ident("option".to_owned()),
-                Token::Equal,
+                Token::Is,
                 Token::Ident("Some".to_owned()),
                 Token::Of,
                 Token::TypeParameter("a".to_owned()),
@@ -601,7 +663,7 @@ end
                 Token::Ident("map".to_owned()),
                 Token::Ident("m".to_owned()),
                 Token::Ident("f".to_owned()),
-                Token::Equal,
+                Token::Is,
                 // match expression
                 Token::Match,
                 Token::Ident("m".to_owned()),
