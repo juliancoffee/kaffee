@@ -1,2 +1,4 @@
 use_try_shorthand = true
 imports_granularity="Crate"
+
+max_width = 80
