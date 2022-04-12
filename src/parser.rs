@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic)]
 #![allow(unused)]
 use chumsky::prelude::*;
 
@@ -114,7 +115,13 @@ enum Expr {
     List(Vec<Expr>),
     Tuple(Vec<Expr>),
     // Complex
-    Call { called: Box<Expr>, args: Vec<Expr> },
+    App(Box<Expr>, Box<Expr>),
+}
+
+impl Expr {
+    fn app(f: Self, x: Self) -> Self {
+        Self::App(Box::new(f), Box::new(x))
+    }
 }
 
 fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
@@ -125,7 +132,7 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
             Token::Str(s) => Expr::Str(s),
         };
 
-        let grouped = expr
+        let enclosed = expr
             .clone()
             .delimited_by(just(Token::OpenParen), just(Token::CloseParen));
 
@@ -136,10 +143,10 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
             .collect::<Vec<_>>()
             .map(Expr::Tuple);
 
-        let atom = atom.or(grouped).or(tuple);
+        let group = atom.or(enclosed).or(tuple);
 
         let list = recursive(|sublist| {
-            let element = atom.clone().or(sublist.clone());
+            let element = group.clone().or(sublist.clone());
 
             element
                 .clone()
@@ -149,18 +156,9 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
                 .map(Expr::List)
         });
 
-        let term = atom.or(list);
+        let term = group.or(list);
 
-        let call = term.clone().then(term.clone().repeated()).map(|(a, args)| {
-            if args.is_empty() {
-                a
-            } else {
-                Expr::Call {
-                    called: Box::new(a),
-                    args,
-                }
-            }
-        });
+        let call = term.clone().then(term.clone().repeated()).foldl(Expr::app);
         let complex = call;
 
         complex
@@ -323,10 +321,7 @@ mod tests {
         let src = "next 25";
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::Call {
-                called: Box::new(Expr::Ident("next".to_owned())),
-                args: vec![Expr::Int(25)],
-            }),
+            Ok(Expr::app(Expr::Ident("next".to_owned()), Expr::Int(25))),
         );
     }
 
@@ -335,10 +330,7 @@ mod tests {
         let src = "(next 25)";
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::Call {
-                called: Box::new(Expr::Ident("next".to_owned())),
-                args: vec![Expr::Int(25)],
-            }),
+            Ok(Expr::app(Expr::Ident("next".to_owned()), Expr::Int(25))),
         )
     }
 
@@ -350,10 +342,7 @@ mod tests {
             Ok(Expr::List(vec![
                 Expr::Int(5),
                 Expr::Ident("zero".to_owned()),
-                Expr::Call {
-                    called: Box::new(Expr::Ident("next".to_owned())),
-                    args: vec![Expr::Int(25)],
-                },
+                Expr::app(Expr::Ident("next".to_owned()), Expr::Int(25)),
             ]))
         )
     }
@@ -377,10 +366,10 @@ mod tests {
             parse_expr(src),
             Ok(Expr::List(vec![
                 Expr::Int(5),
-                Expr::Call {
-                    called: Box::new(Expr::Ident("sum".to_owned())),
-                    args: vec![Expr::List(vec![Expr::Int(5), Expr::Int(5)])],
-                },
+                Expr::app(
+                    Expr::Ident("sum".to_owned()),
+                    Expr::List(vec![Expr::Int(5), Expr::Int(5)])
+                ),
             ]))
         )
     }
@@ -390,16 +379,16 @@ mod tests {
         let src = "sum [5 (sum [5 5])]";
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::Call {
-                called: Box::new(Expr::Ident("sum".to_owned())),
-                args: vec![Expr::List(vec![
+            Ok(Expr::app(
+                Expr::Ident("sum".to_owned()),
+                Expr::List(vec![
                     Expr::Int(5),
-                    Expr::Call {
-                        called: Box::new(Expr::Ident("sum".to_owned())),
-                        args: vec![Expr::List(vec![Expr::Int(5), Expr::Int(5)])],
-                    }
-                ])]
-            })
+                    Expr::app(
+                        Expr::Ident("sum".to_owned()),
+                        Expr::List(vec![Expr::Int(5), Expr::Int(5)])
+                    ),
+                ])
+            ))
         )
     }
 
