@@ -266,7 +266,8 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
         // 2) +, -
         // 3) <, >
         // 4) ==, !=
-        // 5) ||, &&
+        // 5) &&
+        // 6) ||
 
         // parses to  unary(expr) | expr
         let unary = just(Token::Op(Op::Minus))
@@ -454,6 +455,15 @@ mod tests {
                 Expr::Int(5),
                 Expr::ident("next"),
             ])),
+        )
+    }
+
+    #[test]
+    fn parse_unit_expr() {
+        let src = "()";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::Tuple(vec![]))
         )
     }
 
@@ -682,6 +692,27 @@ mod tests {
                 ),
                 Expr::ident("y"),
             ))
+        )
+    }
+
+    #[test]
+    fn parse_arithmetic_in_tuple_expr() {
+        let src = "(0, 0 + 1, 1 + 2)";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::Tuple(vec![
+                Expr::Int(0),
+                Expr::binop_with(
+                    BinOp::Sum,
+                    Expr::Int(0),
+                    Expr::Int(1),
+                ),
+                Expr::binop_with(
+                    BinOp::Sum,
+                    Expr::Int(1),
+                    Expr::Int(2),
+                ),
+            ]))
         )
     }
 
