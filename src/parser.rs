@@ -18,8 +18,12 @@ enum Op {
     Greater,
     // ==
     Equal,
+    // !=
+    NotEqual,
     // ||
     Or,
+    // &&
+    And,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -59,7 +63,15 @@ enum Token {
     // Separators
     Comma,
     Either,
-    Product,
+}
+
+impl Token {
+    fn op_expect(&self) -> &Op {
+        match self {
+            Self::Op(op) => op,
+            token => panic!("expected Token::Op(_), got {token:?}"),
+        }
+    }
 }
 
 fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
@@ -97,7 +109,9 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         .to(Token::Op(Op::Less))
         .or(just('>').to(Token::Op(Op::Greater)))
         .or(just("==").to(Token::Op(Op::Equal)))
+        .or(just("!=").to(Token::Op(Op::NotEqual)))
         .or(just("||").to(Token::Op(Op::Or)))
+        .or(just("&&").to(Token::Op(Op::And)))
         .or(just('+').to(Token::Op(Op::Plus)))
         .or(just('-').to(Token::Op(Op::Minus)))
         .or(just('*').to(Token::Op(Op::Product)));
@@ -132,9 +146,17 @@ enum UnOp {
 
 #[derive(Debug, PartialEq, Clone)]
 enum BinOp {
+    // arithmetic
     Sum,
     Sub,
     Product,
+    // logic
+    Less,
+    Greater,
+    Equal,
+    NotEqual,
+    And,
+    Or,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -161,19 +183,31 @@ impl Expr {
         Self::App(Box::new(f), Box::new(x))
     }
 
-    fn make_unary(_op: Token, x: Self) -> Self {
-        Self::unary_with(UnOp::Negative, x)
+    fn make_unary(token: Token, x: Self) -> Self {
+        let op = token.op_expect();
+        let unary = match op {
+            Op::Minus => UnOp::Negative,
+            _ => unreachable!(),
+        };
+        Self::unary_with(unary, x)
     }
 
     fn unary_with(op: UnOp, x: Self) -> Self {
         Self::Unary(op, Box::new(x))
     }
 
-    fn make_binop(op: Token, x: Self, y: Self) -> Self {
+    fn make_binop(token: Token, x: Self, y: Self) -> Self {
+        let op = token.op_expect();
         let binop = match op {
-            Token::Op(Op::Minus) => BinOp::Sub,
-            Token::Op(Op::Plus) => BinOp::Sum,
-            Token::Op(Op::Product) => BinOp::Product,
+            Op::Minus => BinOp::Sub,
+            Op::Plus => BinOp::Sum,
+            Op::Product => BinOp::Product,
+            Op::Less => BinOp::Less,
+            Op::Greater => BinOp::Greater,
+            Op::Equal => BinOp::Equal,
+            Op::NotEqual => BinOp::NotEqual,
+            Op::And => BinOp::And,
+            Op::Or => BinOp::Or,
             _ => todo!(),
         };
         Self::binop_with(binop, x, y)
@@ -186,13 +220,13 @@ impl Expr {
 
 fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
     recursive(|expr| {
-        let atom = select! {
+        let literal = select! {
             Token::Int(i) => Expr::Int(i.parse().unwrap()),
             Token::Ident(i) => Expr::Ident(i),
             Token::Str(s) => Expr::Str(s),
         };
 
-        let enclosed = atom.or(expr
+        let enclosed = literal.or(expr
             .clone()
             .delimited_by(just(Token::OpenParen), just(Token::CloseParen)));
 
@@ -203,10 +237,13 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
             .collect::<Vec<_>>()
             .map(Expr::Tuple);
 
-        let group = enclosed.or(tuple);
+        let atom = enclosed.or(tuple);
+
+        #[cfg(debug_assertions)]
+        let atom = atom.boxed();
 
         let list = recursive(|sublist| {
-            let element = group.clone().or(sublist.clone());
+            let element = atom.clone().or(sublist.clone());
 
             element
                 .clone()
@@ -219,24 +256,32 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
                 .map(Expr::List)
         });
 
-        let term = group.or(list);
+        let term = atom.or(list);
+
+        #[cfg(debug_assertions)]
+        let term = term.boxed();
         // Parse operators
         // 0) unary
         // 1) *
         // 2) +, -
         // 3) <, >
-        // 4) ==
-        // 5) ||
+        // 4) ==, !=
+        // 5) ||, &&
+
+        // parses to  unary(expr) | expr
         let unary = just(Token::Op(Op::Minus))
             .repeated()
             .then(term.clone())
             .foldr(Expr::make_unary);
+
+        // parses to product(expr) | expr
         let product = unary
             .clone()
             .then(just(Token::Op(Op::Product)).then(unary.clone()).repeated())
             .foldl(|x, (op, y)| Expr::make_binop(op, x, y));
 
-        let sum = product
+        // parses to arithmetic(expr) | expr
+        let arithmetic = product
             .clone()
             .then(
                 just(Token::Op(Op::Plus))
@@ -245,13 +290,48 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
                     .repeated(),
             )
             .foldl(|x, (op, y)| Expr::make_binop(op, x, y));
+        #[cfg(debug_assertions)]
+        let arithmetic = arithmetic.boxed();
 
-        let arithmetic = sum;
-
-        let app = arithmetic
+        // parses to cmp_order(expr)
+        let cmp_order = arithmetic
             .clone()
-            .then(term.clone().repeated())
-            .foldl(Expr::app);
+            .then(
+                just(Token::Op(Op::Less))
+                    .or(just(Token::Op(Op::Greater)))
+                    .then(arithmetic.clone()),
+            )
+            .map(|(x, (op, y))| Expr::make_binop(op, x, y));
+
+        // parses to cmp_order(expr) | expr
+        let operand = cmp_order.or(arithmetic);
+
+        // parses to is_equal(expr)
+        let is_equal = operand
+            .clone()
+            .then(
+                just(Token::Op(Op::Equal))
+                    .or(just(Token::Op(Op::NotEqual)))
+                    .then(operand.clone()),
+            )
+            .map(|(x, (op, y))| Expr::make_binop(op, x, y));
+
+        // parses to is_equal(expr) | expr
+        let element = is_equal.or(operand);
+
+        // parses to and(expr) | expr
+        let and = element
+            .clone()
+            .then(just(Token::Op(Op::And)).then(element.clone()).repeated())
+            .foldl(|a, (op, b)| Expr::make_binop(op, a, b));
+
+        // parses to or(expr) | expr
+        let or = and
+            .clone()
+            .then(just(Token::Op(Op::Or)).then(and.clone()).repeated())
+            .foldl(|a, (op, b)| Expr::make_binop(op, a, b));
+
+        let app = or.clone().then(or.clone().repeated()).foldl(Expr::app);
         app
     })
     .map_with_span(|expr, span| (expr, span))
@@ -534,7 +614,7 @@ mod tests {
         let src = "-x";
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::unary_with(UnOp::Negative, Expr::ident("x"),))
+            Ok(Expr::unary_with(UnOp::Negative, Expr::ident("x")))
         )
     }
 
@@ -547,7 +627,7 @@ mod tests {
                 UnOp::Negative,
                 Expr::unary_with(
                     UnOp::Negative,
-                    Expr::unary_with(UnOp::Negative, Expr::ident("x"),),
+                    Expr::unary_with(UnOp::Negative, Expr::ident("x")),
                 ),
             ))
         )
@@ -631,19 +711,204 @@ mod tests {
 
     #[test]
     fn tokenize_logic_expr() {
-        let src = "x < y || z > y";
+        let src = "x < y && z > y || x == 0 && z != 100";
         assert_eq!(
             remove_spans(lexer().parse(src)),
             Ok(vec![
                 Token::Ident("x".to_owned()),
                 Token::Op(Op::Less),
                 Token::Ident("y".to_owned()),
-                Token::Op(Op::Or),
+                Token::Op(Op::And),
                 Token::Ident("z".to_owned()),
                 Token::Op(Op::Greater),
                 Token::Ident("y".to_owned()),
+                Token::Op(Op::Or),
+                Token::Ident("x".to_owned()),
+                Token::Op(Op::Equal),
+                Token::Int("0".to_owned()),
+                Token::Op(Op::And),
+                Token::Ident("z".to_owned()),
+                Token::Op(Op::NotEqual),
+                Token::Int("100".to_owned()),
             ])
         );
+    }
+
+    #[test]
+    fn parse_less_expr() {
+        let src = "x < y";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Less,
+                Expr::ident("x"),
+                Expr::ident("y")
+            )),
+        )
+    }
+
+    #[test]
+    fn parse_greater_expr() {
+        let src = "x > y";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Greater,
+                Expr::ident("x"),
+                Expr::ident("y")
+            )),
+        )
+    }
+
+    #[test]
+    fn parse_repeated_ordering_expr() {
+        let src = "x < y < z";
+        assert!(parse_expr(src).is_err())
+    }
+
+    #[test]
+    fn parse_equal_expr() {
+        let src = "x == 0";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Equal,
+                Expr::ident("x"),
+                Expr::Int(0)
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_notequal_expr() {
+        let src = "x != 0";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::NotEqual,
+                Expr::ident("x"),
+                Expr::Int(0)
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_and_expr() {
+        let src = "a && b";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::And,
+                Expr::ident("a"),
+                Expr::ident("b")
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_or_expr() {
+        let src = "a || b";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Or,
+                Expr::ident("a"),
+                Expr::ident("b")
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_repeated_or_expr() {
+        let src = "a || b || c";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Or,
+                Expr::binop_with(BinOp::Or, Expr::ident("a"), Expr::ident("b")),
+                Expr::ident("c"),
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_logic_combination_expr() {
+        let src = "a || b && c || d";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Or,
+                Expr::binop_with(
+                    BinOp::Or,
+                    Expr::ident("a"),
+                    Expr::binop_with(
+                        BinOp::And,
+                        Expr::ident("b"),
+                        Expr::ident("c"),
+                    ),
+                ),
+                Expr::ident("d"),
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_logic_forced_precedence_expr() {
+        let src = "a || b && (c || d)";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Or,
+                Expr::ident("a"),
+                Expr::binop_with(
+                    BinOp::And,
+                    Expr::ident("b"),
+                    Expr::binop_with(
+                        BinOp::Or,
+                        Expr::ident("c"),
+                        Expr::ident("d"),
+                    ),
+                ),
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_logic_expr() {
+        let src = "x < y && z > y || x == 0 && z != 100";
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Or,
+                Expr::binop_with(
+                    BinOp::And,
+                    Expr::binop_with(
+                        BinOp::Less,
+                        Expr::ident("x"),
+                        Expr::ident("y"),
+                    ),
+                    Expr::binop_with(
+                        BinOp::Greater,
+                        Expr::ident("z"),
+                        Expr::ident("y"),
+                    ),
+                ),
+                Expr::binop_with(
+                    BinOp::And,
+                    Expr::binop_with(
+                        BinOp::Equal,
+                        Expr::ident("x"),
+                        Expr::Int(0),
+                    ),
+                    Expr::binop_with(
+                        BinOp::NotEqual,
+                        Expr::ident("z"),
+                        Expr::Int(100),
+                    ),
+                ),
+            ))
+        )
     }
 
     #[test]
