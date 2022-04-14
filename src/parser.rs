@@ -12,6 +12,8 @@ enum Op {
     Minus,
     // *
     Product,
+    // /
+    Divide,
     // <
     Less,
     // >
@@ -105,32 +107,34 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     });
     let marked = just('\'').ignore_then(alphabetic).map(Token::TypeParameter);
 
-    let op = just('<')
-        .to(Token::Op(Op::Less))
-        .or(just('>').to(Token::Op(Op::Greater)))
-        .or(just("==").to(Token::Op(Op::Equal)))
-        .or(just("!=").to(Token::Op(Op::NotEqual)))
-        .or(just("||").to(Token::Op(Op::Or)))
-        .or(just("&&").to(Token::Op(Op::And)))
-        .or(just('+').to(Token::Op(Op::Plus)))
-        .or(just('-').to(Token::Op(Op::Minus)))
-        .or(just('*').to(Token::Op(Op::Product)));
+    let op = choice((
+        just('<').to(Token::Op(Op::Less)),
+        just('>').to(Token::Op(Op::Greater)),
+        just("==").to(Token::Op(Op::Equal)),
+        just("!=").to(Token::Op(Op::NotEqual)),
+        just("||").to(Token::Op(Op::Or)),
+        just("&&").to(Token::Op(Op::And)),
+        just('+').to(Token::Op(Op::Plus)),
+        just('-').to(Token::Op(Op::Minus)),
+        just('*').to(Token::Op(Op::Product)),
+        just('/').to(Token::Op(Op::Divide)),
+    ));
 
-    let ctrl = just("=>")
-        .to(Token::MatchArrow)
-        .or(just('=').to(Token::Is))
-        .or(just(';').to(Token::SemiColon))
-        .or(just(',').to(Token::Comma))
-        .or(just('|').to(Token::Either))
-        .or(just('(').to(Token::OpenParen))
-        .or(just(')').to(Token::CloseParen))
-        .or(just('[').to(Token::OpenBracket))
-        .or(just(']').to(Token::CloseBracket))
-        .or(just('{').to(Token::OpenBrace))
-        .or(just('}').to(Token::CloseBrace));
+    let ctrl = choice((
+        just("=>").to(Token::MatchArrow),
+        just('=').to(Token::Is),
+        just(';').to(Token::SemiColon),
+        just(',').to(Token::Comma),
+        just('|').to(Token::Either),
+        just('(').to(Token::OpenParen),
+        just(')').to(Token::CloseParen),
+        just('[').to(Token::OpenBracket),
+        just(']').to(Token::CloseBracket),
+        just('{').to(Token::OpenBrace),
+        just('}').to(Token::CloseBrace),
+    ));
 
-    let token = atom.or(op).or(ctrl).or(marked).or(word);
-    //.recover_with(skip_then_retry_until([]));
+    let token = choice((atom, op, ctrl, marked, word));
 
     token
         .map_with_span(|tok, span| (tok, span))
@@ -150,6 +154,7 @@ enum BinOp {
     Sum,
     Sub,
     Product,
+    Divide,
     // logic
     Less,
     Greater,
@@ -202,13 +207,13 @@ impl Expr {
             Op::Minus => BinOp::Sub,
             Op::Plus => BinOp::Sum,
             Op::Product => BinOp::Product,
+            Op::Divide => BinOp::Divide,
             Op::Less => BinOp::Less,
             Op::Greater => BinOp::Greater,
             Op::Equal => BinOp::Equal,
             Op::NotEqual => BinOp::NotEqual,
             Op::And => BinOp::And,
             Op::Or => BinOp::Or,
-            _ => todo!(),
         };
         Self::binop_with(binop, x, y)
     }
@@ -278,7 +283,12 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
         // parses to product(expr) | expr
         let product = unary
             .clone()
-            .then(just(Token::Op(Op::Product)).then(unary.clone()).repeated())
+            .then(
+                just(Token::Op(Op::Product))
+                    .or(just(Token::Op(Op::Divide)))
+                    .then(unary.clone())
+                    .repeated(),
+            )
             .foldl(|x, (op, y)| Expr::make_binop(op, x, y));
 
         // parses to arithmetic(expr) | expr
@@ -319,6 +329,8 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
 
         // parses to is_equal(expr) | expr
         let element = is_equal.or(operand);
+        #[cfg(debug_assertions)]
+        let element = element.boxed();
 
         // parses to and(expr) | expr
         let and = element
@@ -461,10 +473,7 @@ mod tests {
     #[test]
     fn parse_unit_expr() {
         let src = "()";
-        assert_eq!(
-            parse_expr(src),
-            Ok(Expr::Tuple(vec![]))
-        )
+        assert_eq!(parse_expr(src), Ok(Expr::Tuple(vec![])))
     }
 
     #[test]
@@ -657,6 +666,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_division_expr() {
+        let src = "x / 5";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::binop_with(
+                BinOp::Divide,
+                Expr::ident("x"),
+                Expr::Int(5),
+            ))
+        )
+    }
+
+    #[test]
     fn parse_sum_expr() {
         let src = "5 + x";
         assert_eq!(
@@ -702,16 +724,8 @@ mod tests {
             parse_expr(src),
             Ok(Expr::Tuple(vec![
                 Expr::Int(0),
-                Expr::binop_with(
-                    BinOp::Sum,
-                    Expr::Int(0),
-                    Expr::Int(1),
-                ),
-                Expr::binop_with(
-                    BinOp::Sum,
-                    Expr::Int(1),
-                    Expr::Int(2),
-                ),
+                Expr::binop_with(BinOp::Sum, Expr::Int(0), Expr::Int(1)),
+                Expr::binop_with(BinOp::Sum, Expr::Int(1), Expr::Int(2)),
             ]))
         )
     }
