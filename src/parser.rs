@@ -177,6 +177,12 @@ enum Expr {
     Unary(UnOp, Box<Expr>),
     BinOp(BinOp, Box<Expr>, Box<Expr>),
     App(Box<Expr>, Box<Expr>),
+    // Compound
+    If {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        otherwise: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -220,6 +226,14 @@ impl Expr {
 
     fn binop_with(op: BinOp, x: Self, y: Self) -> Self {
         Self::BinOp(op, Box::new(x), Box::new(y))
+    }
+
+    fn if_with(cond: Self, then: Self, otherwise: Self) -> Self {
+        Self::If {
+            cond: Box::new(cond),
+            then: Box::new(then),
+            otherwise: Box::new(otherwise),
+        }
     }
 }
 
@@ -265,6 +279,10 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
 
         #[cfg(debug_assertions)]
         let term = term.boxed();
+
+        // parses to app(expr) | expr
+        let app = term.clone().then(term.clone().repeated()).foldl(Expr::app);
+
         // Parse operators
         // 0) unary
         // 1) *
@@ -277,7 +295,7 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
         // parses to  unary(expr) | expr
         let unary = just(Token::Op(Op::Minus))
             .repeated()
-            .then(term.clone())
+            .then(app.clone())
             .foldr(Expr::make_unary);
 
         // parses to product(expr) | expr
@@ -344,8 +362,21 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
             .then(just(Token::Op(Op::Or)).then(and.clone()).repeated())
             .foldl(|a, (op, b)| Expr::make_binop(op, a, b));
 
-        let app = or.clone().then(or.clone().repeated()).foldl(Expr::app);
-        app
+        let if_expr = recursive(|subif| {
+            let term = or.clone().or(subif);
+
+            just(Token::If)
+                .ignore_then(term.clone())
+                .then_ignore(just(Token::Then))
+                .then(term.clone())
+                .then_ignore(just(Token::Else))
+                .then(term.clone())
+                .map(|((cond, then), otherwise)| {
+                    Expr::if_with(cond, then, otherwise)
+                })
+        });
+
+        if_expr.or(or)
     })
     .map_with_span(|expr, span| (expr, span))
     .then_ignore(end())
@@ -972,6 +1003,72 @@ mod tests {
                 Token::Int("1".to_owned()),
             ])
         );
+    }
+
+    #[test]
+    fn parse_if_expr() {
+        let src = "if x < y then 0 else 1";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::if_with(
+                Expr::binop_with(
+                    BinOp::Less,
+                    Expr::ident("x"),
+                    Expr::ident("y")
+                ),
+                Expr::Int(0),
+                Expr::Int(1),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_if_deep_expr() {
+        let src = r#"
+if x < y then
+    if x < 0 then
+        -1
+    else 0
+else 1
+        "#;
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::if_with(
+                Expr::binop_with(
+                    BinOp::Less,
+                    Expr::ident("x"),
+                    Expr::ident("y")
+                ),
+                Expr::if_with(
+                    Expr::binop_with(
+                        BinOp::Less,
+                        Expr::ident("x"),
+                        Expr::Int(0)
+                    ),
+                    Expr::unary_with(UnOp::Negative, Expr::Int(1)),
+                    Expr::Int(0),
+                ),
+                Expr::Int(1),
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_if_with_call_cond() {
+        let src = "if next x > 10 then 0 else 1";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::if_with(
+                Expr::binop_with(
+                    BinOp::Greater,
+                    Expr::app(Expr::ident("next"), Expr::ident("x")),
+                    Expr::Int(10),
+                ),
+                Expr::Int(0),
+                Expr::Int(1),
+            ))
+        )
     }
 
     #[test]
