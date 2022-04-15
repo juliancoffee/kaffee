@@ -213,6 +213,7 @@ impl Expr {
         Self::App(Box::new(f), Box::new(x))
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn make_unary(token: Token, x: Self) -> Self {
         let op = token.op_expect();
         let unary = match op {
@@ -226,6 +227,7 @@ impl Expr {
         Self::Unary(op, Box::new(x))
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn make_binop(token: Token, x: Self, y: Self) -> Self {
         let op = token.op_expect();
         let binop = match op {
@@ -264,25 +266,179 @@ impl Expr {
     }
 }
 
-fn pattern() -> impl Parser<Token, Pattern, Error = Simple<Token>> {
+// trait aliases
+trait ExprParser: Parser<Token, Expr, Error = Simple<Token>> {}
+impl<T> ExprParser for T where T: Parser<Token, Expr, Error = Simple<Token>> {}
+
+trait SubParser<O>: Parser<Token, O, Error = Simple<Token>> {}
+impl<T, O> SubParser<O> for T where T: Parser<Token, O, Error = Simple<Token>> {}
+
+// Parses pattern
+fn pattern() -> impl SubParser<Pattern> + Clone {
     select! {
         Token::Ident(i) => Pattern::Ident(i)
     }
 }
 
-fn binding<P>(
+// Parses `let <pat> = <expr>` binding
+//
+// Results in `pat` and `expr`
+fn binding<P: ExprParser + Clone>(
     expr: P,
-) -> impl Parser<Token, (Pattern, Expr), Error = Simple<Token>>
-where
-    P: Parser<Token, Expr, Error = Simple<Token>>,
-{
+) -> impl SubParser<(Pattern, Expr)> + Clone {
     just(Token::Let)
         .ignore_then(pattern())
         .then_ignore(just(Token::Is))
         .then(expr)
 }
 
-fn expression() -> impl Parser<Token, Expr, Error = Simple<Token>> {
+// Parses grouped expression
+//
+// Result in whatever Expr were inside parens
+fn grouping<P: ExprParser>(expr: P) -> impl ExprParser {
+    expr.delimited_by(just(Token::OpenParen), just(Token::CloseParen))
+}
+
+// Parses tuple expression
+//
+// TODO: remake to be used with patterns?
+fn tuple<P: ExprParser>(term: P) -> impl ExprParser {
+    term.separated_by(just(Token::Comma))
+        .delimited_by(just(Token::OpenParen), just(Token::CloseParen))
+        .collect::<Vec<_>>()
+        .map(Expr::Tuple)
+}
+
+// Parses list expression
+fn list<P: ExprParser + 'static>(term: P) -> impl ExprParser {
+    recursive(|sublist| {
+        let element = term.or(sublist.clone());
+
+        element
+            .repeated()
+            .delimited_by(just(Token::OpenBracket), just(Token::CloseBracket))
+            .collect::<Vec<_>>()
+            .map(Expr::List)
+    })
+}
+
+// Parses application `e e e`
+//
+// Returns expression 'as is' if none of applications were found
+//
+// TODO: remake to be used with patterns?
+fn app<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    term.clone().then(term.repeated()).foldl(Expr::app)
+}
+
+// Parses `- x` (for any amount of negations)
+//
+// If none negations were found just returns expression
+fn unary<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    just(Token::Op(Op::Minus))
+        .repeated()
+        .then(term)
+        .foldr(Expr::make_unary)
+}
+
+// Parses product expression `x * y` | `x / y`
+// (for any amount of operators)
+//
+// If none operators were found just returns expression
+fn product<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    term.clone()
+        .then(
+            just(Token::Op(Op::Product))
+                .or(just(Token::Op(Op::Divide)))
+                .then(term)
+                .repeated(),
+        )
+        .foldl(|x, (op, y)| Expr::make_binop(op, x, y))
+}
+
+// Parses arithmetic expression `x + y` | `x - y`
+// (for any amount of operators)
+//
+// If none operators were found just returns expression
+fn arithmetic<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    term.clone()
+        .then(
+            just(Token::Op(Op::Plus))
+                .or(just(Token::Op(Op::Minus)))
+                .then(term)
+                .repeated(),
+        )
+        .foldl(|x, (op, y)| Expr::make_binop(op, x, y))
+}
+
+// Parses order comparisons `x < y` | `x > y`
+fn order<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    term.clone()
+        .then(
+            just(Token::Op(Op::Less))
+                .or(just(Token::Op(Op::Greater)))
+                .then(term),
+        )
+        .map(|(x, (op, y))| Expr::make_binop(op, x, y))
+}
+
+// Parses equality checks `a == b` | `a != b`
+fn equality<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    term.clone()
+        .then(
+            just(Token::Op(Op::Equal))
+                .or(just(Token::Op(Op::NotEqual)))
+                .then(term),
+        )
+        .map(|(x, (op, y))| Expr::make_binop(op, x, y))
+}
+
+// Parses logic and `a && b` (for any amount of &&)
+//
+// If none of `&&` were found just returns expression
+fn and<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    term.clone()
+        .then(just(Token::Op(Op::And)).then(term).repeated())
+        .foldl(|a, (op, b)| Expr::make_binop(op, a, b))
+}
+
+// Parses logic or `a || b` (for any amount of ||)
+//
+// If none of `||` were found just returns expression
+fn or<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    term.clone()
+        .then(just(Token::Op(Op::Or)).then(term).repeated())
+        .foldl(|a, (op, b)| Expr::make_binop(op, a, b))
+}
+
+// Parses if <cond> then <yes> else <no>
+fn if_expr<P: ExprParser + Clone + 'static>(
+    term: P,
+) -> impl ExprParser + Clone {
+    recursive(|subif| {
+        let expr = term.clone().or(subif);
+
+        just(Token::If)
+            .ignore_then(expr.clone())
+            .then_ignore(just(Token::Then))
+            .then(expr.clone())
+            .then_ignore(just(Token::Else))
+            .then(expr)
+            .map(|((cond, then), otherwise)| {
+                Expr::if_with(cond, then, otherwise)
+            })
+    })
+}
+
+// Parses let <pat> = <src> in <tgt>
+fn let_in<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    binding(term.clone())
+        .then_ignore(just(Token::In))
+        .then(term)
+        .map(|((pat, src), target)| Expr::letin_with(pat, src, target))
+}
+
+fn expression() -> impl ExprParser + Clone {
     recursive(|expr| {
         let literal = select! {
             Token::Int(i) => Expr::Int(i.parse().unwrap()),
@@ -290,143 +446,44 @@ fn expression() -> impl Parser<Token, Expr, Error = Simple<Token>> {
             Token::Str(s) => Expr::Str(s),
         };
 
-        let enclosed = literal.or(expr
-            .clone()
-            .delimited_by(just(Token::OpenParen), just(Token::CloseParen)));
-
-        let tuple = expr
-            .clone()
-            .separated_by(just(Token::Comma))
-            .delimited_by(just(Token::OpenParen), just(Token::CloseParen))
-            .collect::<Vec<_>>()
-            .map(Expr::Tuple);
-
-        let atom = enclosed.or(tuple);
-
+        // literal | grouping | tuple
+        let atom =
+            choice((literal, grouping(expr.clone()), tuple(expr.clone())));
         #[cfg(debug_assertions)]
         let atom = atom.boxed();
-
-        let list = recursive(|sublist| {
-            let element = atom.clone().or(sublist.clone());
-
-            element
-                .clone()
-                .repeated()
-                .delimited_by(
-                    just(Token::OpenBracket),
-                    just(Token::CloseBracket),
-                )
-                .collect::<Vec<_>>()
-                .map(Expr::List)
-        });
-
+        // list
+        let list = list(atom.clone());
         let term = atom.or(list);
-
         #[cfg(debug_assertions)]
         let term = term.boxed();
-
-        // parses to app(expr) | expr
-        let app = term.clone().then(term.clone().repeated()).foldl(Expr::app);
-
-        // Parse operators
-        // 0) unary
-        // 1) *
-        // 2) +, -
-        // 3) <, >
-        // 4) ==, !=
-        // 5) &&
-        // 6) ||
-
-        // parses to  unary(expr) | expr
-        let unary = just(Token::Op(Op::Minus))
-            .repeated()
-            .then(app.clone())
-            .foldr(Expr::make_unary);
-
-        // parses to product(expr) | expr
-        let product = unary
-            .clone()
-            .then(
-                just(Token::Op(Op::Product))
-                    .or(just(Token::Op(Op::Divide)))
-                    .then(unary.clone())
-                    .repeated(),
-            )
-            .foldl(|x, (op, y)| Expr::make_binop(op, x, y));
-
-        // parses to arithmetic(expr) | expr
-        let arithmetic = product
-            .clone()
-            .then(
-                just(Token::Op(Op::Plus))
-                    .or(just(Token::Op(Op::Minus)))
-                    .then(product.clone())
-                    .repeated(),
-            )
-            .foldl(|x, (op, y)| Expr::make_binop(op, x, y));
+        // application (e e e)
+        let app = app(term.clone());
+        // unary negation
+        let unary = unary(app.clone());
+        // product (*, /)
+        let product = product(unary.clone());
+        // arithmetic (+, -)
+        let arithmetic = arithmetic(product.clone());
         #[cfg(debug_assertions)]
         let arithmetic = arithmetic.boxed();
-
-        // parses to cmp_order(expr)
-        let cmp_order = arithmetic
-            .clone()
-            .then(
-                just(Token::Op(Op::Less))
-                    .or(just(Token::Op(Op::Greater)))
-                    .then(arithmetic.clone()),
-            )
-            .map(|(x, (op, y))| Expr::make_binop(op, x, y));
-
-        // parses to cmp_order(expr) | expr
-        let operand = cmp_order.or(arithmetic);
-
-        // parses to is_equal(expr)
-        let is_equal = operand
-            .clone()
-            .then(
-                just(Token::Op(Op::Equal))
-                    .or(just(Token::Op(Op::NotEqual)))
-                    .then(operand.clone()),
-            )
-            .map(|(x, (op, y))| Expr::make_binop(op, x, y));
-
-        // parses to is_equal(expr) | expr
-        let element = is_equal.or(operand);
+        // order (<, >)
+        let order = order(arithmetic.clone());
+        let operand = order.or(arithmetic);
+        // equality (==, !=)
+        let equality = equality(operand.clone());
+        let element = equality.or(operand);
         #[cfg(debug_assertions)]
         let element = element.boxed();
+        // and (&&)
+        let and = and(element.clone());
+        // or
+        let or = or(and.clone());
+        // if <cond> then <yes> else <no>
+        let if_expr = if_expr(or.clone());
+        // let <pat> = <src> in <target>
+        let let_in = let_in(if_expr.clone().or(or.clone()));
 
-        // parses to and(expr) | expr
-        let and = element
-            .clone()
-            .then(just(Token::Op(Op::And)).then(element.clone()).repeated())
-            .foldl(|a, (op, b)| Expr::make_binop(op, a, b));
-
-        // parses to or(expr) | expr
-        let or = and
-            .clone()
-            .then(just(Token::Op(Op::Or)).then(and.clone()).repeated())
-            .foldl(|a, (op, b)| Expr::make_binop(op, a, b));
-
-        let if_expr = recursive(|subif| {
-            let term = or.clone().or(subif);
-
-            just(Token::If)
-                .ignore_then(term.clone())
-                .then_ignore(just(Token::Then))
-                .then(term.clone())
-                .then_ignore(just(Token::Else))
-                .then(term.clone())
-                .map(|((cond, then), otherwise)| {
-                    Expr::if_with(cond, then, otherwise)
-                })
-        });
-
-        let let_expr = binding(if_expr.clone().or(or.clone()))
-            .then_ignore(just(Token::In))
-            .then(if_expr.clone().or(or.clone()))
-            .map(|((pat, src), target)| Expr::letin_with(pat, src, target));
-
-        if_expr.or(or).or(let_expr)
+        choice((if_expr, or, let_in))
     })
 }
 
@@ -435,7 +492,7 @@ enum Statement {
     Let { pat: Pattern, expr: Expr },
 }
 
-fn statement() -> impl Parser<Token, Statement, Error = Simple<Token>> {
+fn statement() -> impl SubParser<Statement> {
     let stmt = binding(expression())
         .then_ignore(just(Token::SemiColon))
         .map(|(pat, expr)| Statement::Let { pat, expr });
@@ -462,6 +519,8 @@ mod tests {
     fn parse_expr(src: &str) -> Result<Expr, Vec<Simple<Token>>> {
         let tokens = lexer().parse(src).unwrap();
         let end = src.chars().count();
+
+        #[allow(clippy::range_plus_one)]
         let token_stream = Stream::from_iter(end..end + 1, tokens.into_iter());
 
         expression().parse(token_stream)
@@ -470,6 +529,8 @@ mod tests {
     fn parse_stmt(src: &str) -> Result<Statement, Vec<Simple<Token>>> {
         let tokens = lexer().parse(src).unwrap();
         let end = src.chars().count();
+
+        #[allow(clippy::range_plus_one)]
         let token_stream = Stream::from_iter(end..end + 1, tokens.into_iter());
 
         statement().parse(token_stream)
@@ -487,7 +548,7 @@ mod tests {
     #[test]
     fn parse_ident_expr() {
         let src = "zero";
-        assert_eq!(parse_expr(src), Ok(Expr::ident("zero")))
+        assert_eq!(parse_expr(src), Ok(Expr::ident("zero")));
     }
 
     #[test]
@@ -503,7 +564,7 @@ mod tests {
     fn parse_integer_expr() {
         let src = "50";
 
-        assert_eq!(parse_expr(src), Ok(Expr::Int(50)))
+        assert_eq!(parse_expr(src), Ok(Expr::Int(50)));
     }
 
     #[test]
@@ -514,7 +575,7 @@ mod tests {
         assert_eq!(
             remove_spans(lexer().parse(src)),
             Ok(vec![Token::Str("hello, kaffee!".to_owned())])
-        )
+        );
     }
 
     #[test]
@@ -523,7 +584,7 @@ mod tests {
         "hello kaffee!"
         "#;
 
-        assert_eq!(parse_expr(src), Ok(Expr::Str("hello kaffee!".to_owned())))
+        assert_eq!(parse_expr(src), Ok(Expr::Str("hello kaffee!".to_owned())));
     }
 
     #[test]
@@ -540,7 +601,7 @@ mod tests {
                 Token::Ident("next".to_owned()),
                 Token::CloseParen,
             ])
-        )
+        );
     }
 
     #[test]
@@ -553,7 +614,7 @@ mod tests {
                 Expr::Int(5),
                 Expr::ident("next"),
             ])),
-        )
+        );
     }
 
     #[test]
@@ -567,13 +628,13 @@ mod tests {
                 Expr::Int(5),
                 Expr::ident("next"),
             ])),
-        )
+        );
     }
 
     #[test]
     fn parse_unit_expr() {
         let src = "()";
-        assert_eq!(parse_expr(src), Ok(Expr::Tuple(vec![])))
+        assert_eq!(parse_expr(src), Ok(Expr::Tuple(vec![])));
     }
 
     #[test]
@@ -587,7 +648,7 @@ mod tests {
                 Expr::app(Expr::ident("next"), Expr::Int(4)),
                 Expr::ident("next"),
             ])),
-        )
+        );
     }
 
     #[test]
@@ -611,7 +672,7 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::List(vec![Expr::Int(5), Expr::Int(25)]))
-        )
+        );
     }
 
     #[test]
@@ -649,7 +710,7 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::app(Expr::ident("next"), Expr::Int(25))),
-        )
+        );
     }
 
     #[test]
@@ -662,7 +723,7 @@ mod tests {
                 Expr::ident("zero"),
                 Expr::app(Expr::ident("next"), Expr::Int(25)),
             ]))
-        )
+        );
     }
 
     #[test]
@@ -674,7 +735,7 @@ mod tests {
                 Expr::List(vec![Expr::Int(5), Expr::Int(5)]),
                 Expr::List(vec![Expr::Int(5), Expr::Int(5)]),
             ]))
-        )
+        );
     }
 
     #[test]
@@ -689,7 +750,7 @@ mod tests {
                     Expr::List(vec![Expr::Int(5), Expr::Int(5)])
                 ),
             ]))
-        )
+        );
     }
 
     #[test]
@@ -707,7 +768,7 @@ mod tests {
                     ),
                 ])
             ))
-        )
+        );
     }
 
     #[test]
@@ -734,7 +795,7 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::unary_with(UnOp::Negative, Expr::ident("x")))
-        )
+        );
     }
 
     #[test]
@@ -749,7 +810,7 @@ mod tests {
                     Expr::unary_with(UnOp::Negative, Expr::ident("x")),
                 ),
             ))
-        )
+        );
     }
 
     #[test]
@@ -762,7 +823,7 @@ mod tests {
                 Expr::ident("x"),
                 Expr::Int(5),
             ))
-        )
+        );
     }
 
     #[test]
@@ -775,7 +836,7 @@ mod tests {
                 Expr::ident("x"),
                 Expr::Int(5),
             ))
-        )
+        );
     }
 
     #[test]
@@ -784,7 +845,7 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::binop_with(BinOp::Sum, Expr::Int(5), Expr::ident("x")))
-        )
+        );
     }
 
     #[test]
@@ -793,7 +854,7 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::binop_with(BinOp::Sub, Expr::Int(5), Expr::ident("x")))
-        )
+        );
     }
 
     #[test]
@@ -814,7 +875,7 @@ mod tests {
                 ),
                 Expr::ident("y"),
             ))
-        )
+        );
     }
 
     #[test]
@@ -827,7 +888,7 @@ mod tests {
                 Expr::binop_with(BinOp::Sum, Expr::Int(0), Expr::Int(1)),
                 Expr::binop_with(BinOp::Sum, Expr::Int(1), Expr::Int(2)),
             ]))
-        )
+        );
     }
 
     #[test]
@@ -851,7 +912,7 @@ mod tests {
                 ),
                 Expr::binop_with(BinOp::Sum, Expr::ident("x"), Expr::Int(5)),
             ]))
-        )
+        );
     }
 
     #[test]
@@ -889,7 +950,7 @@ mod tests {
                 Expr::ident("x"),
                 Expr::ident("y")
             )),
-        )
+        );
     }
 
     #[test]
@@ -902,13 +963,13 @@ mod tests {
                 Expr::ident("x"),
                 Expr::ident("y")
             )),
-        )
+        );
     }
 
     #[test]
     fn parse_repeated_ordering_expr() {
         let src = "(x < y < z)";
-        assert!(parse_expr(src).is_err())
+        assert!(parse_expr(src).is_err());
     }
 
     #[test]
@@ -921,7 +982,7 @@ mod tests {
                 Expr::ident("x"),
                 Expr::Int(0)
             ))
-        )
+        );
     }
 
     #[test]
@@ -934,7 +995,7 @@ mod tests {
                 Expr::ident("x"),
                 Expr::Int(0)
             ))
-        )
+        );
     }
 
     #[test]
@@ -947,7 +1008,7 @@ mod tests {
                 Expr::ident("a"),
                 Expr::ident("b")
             ))
-        )
+        );
     }
 
     #[test]
@@ -960,7 +1021,7 @@ mod tests {
                 Expr::ident("a"),
                 Expr::ident("b")
             ))
-        )
+        );
     }
 
     #[test]
@@ -973,7 +1034,7 @@ mod tests {
                 Expr::binop_with(BinOp::Or, Expr::ident("a"), Expr::ident("b")),
                 Expr::ident("c"),
             ))
-        )
+        );
     }
 
     #[test]
@@ -994,7 +1055,7 @@ mod tests {
                 ),
                 Expr::ident("d"),
             ))
-        )
+        );
     }
 
     #[test]
@@ -1015,7 +1076,7 @@ mod tests {
                     ),
                 ),
             ))
-        )
+        );
     }
 
     #[test]
@@ -1053,7 +1114,7 @@ mod tests {
                     ),
                 ),
             ))
-        )
+        );
     }
 
     #[test]
@@ -1120,7 +1181,7 @@ else 1
                 ),
                 Expr::Int(1),
             ))
-        )
+        );
     }
 
     #[test]
@@ -1137,7 +1198,7 @@ else 1
                 Expr::Int(0),
                 Expr::Int(1),
             ))
-        )
+        );
     }
 
     #[test]
@@ -1167,7 +1228,7 @@ else 1
                 Expr::Int(5),
                 Expr::app(Expr::ident("Some"), Expr::ident("x"))
             ))
-        )
+        );
     }
 
     #[test]
@@ -1216,7 +1277,7 @@ else 1
                 pat: Pattern::ident("x"),
                 expr: Expr::Int(50),
             })
-        )
+        );
     }
 
     #[test]
@@ -1276,7 +1337,7 @@ else 1
                 Token::Ident("int".to_owned()),
                 Token::SemiColon,
             ])
-        )
+        );
     }
 
     #[test]
@@ -1302,7 +1363,7 @@ else 1
                 Token::Ident("int".to_owned()),
                 Token::CloseBrace,
             ])
-        )
+        );
     }
 
     #[test]
