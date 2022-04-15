@@ -2,6 +2,13 @@
 #![allow(unused)]
 use chumsky::prelude::*;
 
+// aliases
+trait ExprParser: Parser<Token, Expr, Error = Simple<Token>> {}
+impl<T> ExprParser for T where T: Parser<Token, Expr, Error = Simple<Token>> {}
+
+trait SubParser<O>: Parser<Token, O, Error = Simple<Token>> {}
+impl<T, O> SubParser<O> for T where T: Parser<Token, O, Error = Simple<Token>> {}
+
 type Span = std::ops::Range<usize>;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -167,6 +174,7 @@ enum BinOp {
 #[derive(Debug, PartialEq, Clone)]
 enum Pattern {
     Ident(String),
+    Tuple(Vec<Self>),
 }
 
 impl Pattern {
@@ -266,18 +274,16 @@ impl Expr {
     }
 }
 
-// trait aliases
-trait ExprParser: Parser<Token, Expr, Error = Simple<Token>> {}
-impl<T> ExprParser for T where T: Parser<Token, Expr, Error = Simple<Token>> {}
-
-trait SubParser<O>: Parser<Token, O, Error = Simple<Token>> {}
-impl<T, O> SubParser<O> for T where T: Parser<Token, O, Error = Simple<Token>> {}
-
 // Parses pattern
 fn pattern() -> impl SubParser<Pattern> + Clone {
-    select! {
-        Token::Ident(i) => Pattern::Ident(i)
-    }
+    recursive(|pat| {
+        let literal = select! {
+            Token::Ident(i) => Pattern::Ident(i)
+        };
+
+        let tuple = tuple_like(pat, Pattern::Tuple);
+        literal.or(tuple)
+    })
 }
 
 // Parses `let <pat> = <expr>` binding
@@ -299,14 +305,21 @@ fn grouping<P: ExprParser>(expr: P) -> impl ExprParser {
     expr.delimited_by(just(Token::OpenParen), just(Token::CloseParen))
 }
 
-// Parses tuple expression
-//
-// TODO: remake to be used with patterns?
-fn tuple<P: ExprParser>(term: P) -> impl ExprParser {
-    term.separated_by(just(Token::Comma))
+// Parses comma separated items delimited by parens
+fn tuple_like<S, O, F, P>(item: P, f: F) -> impl SubParser<O>
+where
+    F: Fn(Vec<S>) -> O,
+    P: SubParser<S>,
+{
+    item.separated_by(just(Token::Comma))
         .delimited_by(just(Token::OpenParen), just(Token::CloseParen))
         .collect::<Vec<_>>()
-        .map(Expr::Tuple)
+        .map(f)
+}
+
+// Parses tuple expression
+fn tuple<P: ExprParser>(term: P) -> impl ExprParser {
+    tuple_like(term, Expr::Tuple)
 }
 
 // Parses list expression
@@ -1228,6 +1241,50 @@ else 1
                 Expr::Int(5),
                 Expr::app(Expr::ident("Some"), Expr::ident("x"))
             ))
+        );
+    }
+
+    #[test]
+    fn parse_let_in_tuple_expr() {
+        let src = "let (x, y) = (5, 10) in x + y";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::letin_with(
+                Pattern::Tuple(vec![Pattern::ident("x"), Pattern::ident("y")]),
+                Expr::Tuple(vec![Expr::Int(5), Expr::Int(10)]),
+                Expr::binop_with(
+                    BinOp::Sum,
+                    Expr::ident("x"),
+                    Expr::ident("y"),
+                )
+            )),
+        );
+    }
+
+    #[test]
+    fn parse_let_in_tuple_deep_expr() {
+        let src = "let (x, (y, z)) = pack in x + y + z";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::letin_with(
+                Pattern::Tuple(vec![
+                    Pattern::ident("x"),
+                    Pattern::Tuple(vec![
+                        Pattern::ident("y"),
+                        Pattern::ident("z"),
+                    ]),
+                ]),
+                Expr::ident("pack"),
+                Expr::binop_with(
+                    BinOp::Sum,
+                    Expr::binop_with(
+                        BinOp::Sum,
+                        Expr::ident("x"),
+                        Expr::ident("y"),
+                    ),
+                    Expr::ident("z"),
+                )
+            )),
         );
     }
 
