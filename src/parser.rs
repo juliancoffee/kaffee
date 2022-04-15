@@ -165,6 +165,17 @@ enum BinOp {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+enum Pattern {
+    Ident(String),
+}
+
+impl Pattern {
+    fn ident(name: &str) -> Self {
+        Self::Ident(name.to_owned())
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
 enum Expr {
     // Atoms
     Int(u64),
@@ -178,16 +189,24 @@ enum Expr {
     BinOp(BinOp, Box<Expr>, Box<Expr>),
     App(Box<Expr>, Box<Expr>),
     // Compound
+    // if <cond> then <yes> else <no>
     If {
         cond: Box<Expr>,
-        then: Box<Expr>,
-        otherwise: Box<Expr>,
+        yes: Box<Expr>,
+        // TODO: make optional?
+        no: Box<Expr>,
+    },
+    // let <pat> = <src> in <target>
+    LetIn {
+        pat: Pattern,
+        src: Box<Expr>,
+        target: Box<Expr>,
     },
 }
 
 impl Expr {
     fn ident(name: &str) -> Self {
-        Expr::Ident(name.to_owned())
+        Self::Ident(name.to_owned())
     }
 
     fn app(f: Self, x: Self) -> Self {
@@ -231,13 +250,39 @@ impl Expr {
     fn if_with(cond: Self, then: Self, otherwise: Self) -> Self {
         Self::If {
             cond: Box::new(cond),
-            then: Box::new(then),
-            otherwise: Box::new(otherwise),
+            yes: Box::new(then),
+            no: Box::new(otherwise),
+        }
+    }
+
+    fn letin_with(pat: Pattern, src: Self, target: Self) -> Self {
+        Self::LetIn {
+            pat,
+            src: Box::new(src),
+            target: Box::new(target),
         }
     }
 }
 
-fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
+fn pattern() -> impl Parser<Token, Pattern, Error = Simple<Token>> {
+    select! {
+        Token::Ident(i) => Pattern::Ident(i)
+    }
+}
+
+fn binding<P>(
+    expr: P,
+) -> impl Parser<Token, (Pattern, Expr), Error = Simple<Token>>
+where
+    P: Parser<Token, Expr, Error = Simple<Token>>,
+{
+    just(Token::Let)
+        .ignore_then(pattern())
+        .then_ignore(just(Token::Is))
+        .then(expr)
+}
+
+fn expression() -> impl Parser<Token, Expr, Error = Simple<Token>> {
     recursive(|expr| {
         let literal = select! {
             Token::Int(i) => Expr::Int(i.parse().unwrap()),
@@ -376,10 +421,26 @@ fn expression() -> impl Parser<Token, (Expr, Span), Error = Simple<Token>> {
                 })
         });
 
-        if_expr.or(or)
+        let let_expr = binding(if_expr.clone().or(or.clone()))
+            .then_ignore(just(Token::In))
+            .then(if_expr.clone().or(or.clone()))
+            .map(|((pat, src), target)| Expr::letin_with(pat, src, target));
+
+        if_expr.or(or).or(let_expr)
     })
-    .map_with_span(|expr, span| (expr, span))
-    .then_ignore(end())
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum Statement {
+    Let { pat: Pattern, expr: Expr },
+}
+
+fn statement() -> impl Parser<Token, Statement, Error = Simple<Token>> {
+    let stmt = binding(expression())
+        .then_ignore(just(Token::SemiColon))
+        .map(|(pat, expr)| Statement::Let { pat, expr });
+
+    stmt.then_ignore(end())
 }
 
 #[cfg(test)]
@@ -403,7 +464,15 @@ mod tests {
         let end = src.chars().count();
         let token_stream = Stream::from_iter(end..end + 1, tokens.into_iter());
 
-        remove_span(expression().parse(token_stream))
+        expression().parse(token_stream)
+    }
+
+    fn parse_stmt(src: &str) -> Result<Statement, Vec<Simple<Token>>> {
+        let tokens = lexer().parse(src).unwrap();
+        let end = src.chars().count();
+        let token_stream = Stream::from_iter(end..end + 1, tokens.into_iter());
+
+        statement().parse(token_stream)
     }
 
     #[test]
@@ -838,7 +907,7 @@ mod tests {
 
     #[test]
     fn parse_repeated_ordering_expr() {
-        let src = "x < y < z";
+        let src = "(x < y < z)";
         assert!(parse_expr(src).is_err())
     }
 
@@ -1072,6 +1141,36 @@ else 1
     }
 
     #[test]
+    fn tokenize_let_in_expr() {
+        let src = "let x = 5 in Some x";
+        assert_eq!(
+            remove_spans(lexer().parse(src)),
+            Ok(vec![
+                Token::Let,
+                Token::Ident("x".to_owned()),
+                Token::Is,
+                Token::Int("5".to_owned()),
+                Token::In,
+                Token::Ident("Some".to_owned()),
+                Token::Ident("x".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_let_in_expr() {
+        let src = "let x = 5 in Some x";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::letin_with(
+                Pattern::ident("x"),
+                Expr::Int(5),
+                Expr::app(Expr::ident("Some"), Expr::ident("x"))
+            ))
+        )
+    }
+
+    #[test]
     fn tokenize_match_expr() {
         let src = "match m | Some x => f x | None => None";
         assert_eq!(
@@ -1094,23 +1193,6 @@ else 1
     }
 
     #[test]
-    fn tokenize_let_in_expr() {
-        let src = "let x = 5 in Some x";
-        assert_eq!(
-            remove_spans(lexer().parse(src)),
-            Ok(vec![
-                Token::Let,
-                Token::Ident("x".to_owned()),
-                Token::Is,
-                Token::Int("5".to_owned()),
-                Token::In,
-                Token::Ident("Some".to_owned()),
-                Token::Ident("x".to_owned()),
-            ])
-        );
-    }
-
-    #[test]
     fn tokenize_let_stmnt() {
         let src = "let x = 50;";
         assert_eq!(
@@ -1123,6 +1205,18 @@ else 1
                 Token::SemiColon,
             ])
         );
+    }
+
+    #[test]
+    fn parse_let_stmt() {
+        let src = "let x = 50;";
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::Let {
+                pat: Pattern::ident("x"),
+                expr: Expr::Int(50),
+            })
+        )
     }
 
     #[test]
