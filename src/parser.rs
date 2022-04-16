@@ -174,12 +174,18 @@ enum BinOp {
 #[derive(Debug, PartialEq, Clone)]
 enum Pattern {
     Ident(String),
+    Int(u64),
     Tuple(Vec<Self>),
+    Variant(String, Box<Self>),
 }
 
 impl Pattern {
     fn ident(name: &str) -> Self {
         Self::Ident(name.to_owned())
+    }
+
+    fn variant_with(name: &str, inner: Self) -> Self {
+        Self::Variant(name.to_owned(), Box::new(inner))
     }
 }
 
@@ -190,25 +196,32 @@ enum Expr {
     Ident(String),
     Str(String),
     // Collections
-    List(Vec<Expr>),
-    Tuple(Vec<Expr>),
+    List(Vec<Self>),
+    Tuple(Vec<Self>),
     // Complex
-    Unary(UnOp, Box<Expr>),
-    BinOp(BinOp, Box<Expr>, Box<Expr>),
-    App(Box<Expr>, Box<Expr>),
+    Unary(UnOp, Box<Self>),
+    BinOp(BinOp, Box<Self>, Box<Self>),
+    App(Box<Self>, Box<Self>),
     // Compound
     // if <cond> then <yes> else <no>
     If {
-        cond: Box<Expr>,
-        yes: Box<Expr>,
+        cond: Box<Self>,
+        yes: Box<Self>,
         // TODO: make optional?
-        no: Box<Expr>,
+        no: Box<Self>,
     },
     // let <pat> = <src> in <target>
     LetIn {
         pat: Pattern,
-        src: Box<Expr>,
-        target: Box<Expr>,
+        src: Box<Self>,
+        target: Box<Self>,
+    },
+    // match <matched>
+    //   | <pat> => <target>
+    //   ...
+    Match {
+        matched: Box<Self>,
+        branches: Vec<(Pattern, Self)>,
     },
 }
 
@@ -272,17 +285,30 @@ impl Expr {
             target: Box::new(target),
         }
     }
+
+    fn match_with(matched: Self, branches: Vec<(Pattern, Self)>) -> Self {
+        Self::Match {
+            matched: Box::new(matched),
+            branches,
+        }
+    }
 }
 
 // Parses pattern
 fn pattern() -> impl SubParser<Pattern> + Clone {
     recursive(|pat| {
         let literal = select! {
-            Token::Ident(i) => Pattern::Ident(i)
+            // FIXME: this unwrap may panic (u64 is "finite")
+            Token::Int(i) => Pattern::Int(i.parse().unwrap()),
+            Token::Ident(i) => Pattern::Ident(i),
         };
 
-        let tuple = tuple_like(pat, Pattern::Tuple);
-        literal.or(tuple)
+        let tuple = tuple_like(pat.clone(), Pattern::Tuple);
+        let variant = select! {Token::Ident(i) => i}
+            .then(pat.clone())
+            .map(|(name, pat)| Pattern::variant_with(&name, pat));
+
+        choice((variant, tuple, literal))
     })
 }
 
@@ -451,9 +477,25 @@ fn let_in<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
         .map(|((pat, src), target)| Expr::letin_with(pat, src, target))
 }
 
+fn match_expr<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    just(Token::Match)
+        .ignore_then(term.clone())
+        .then(
+            just(Token::Either)
+                .ignore_then(pattern())
+                .then_ignore(just(Token::MatchArrow))
+                .then(term)
+                .repeated()
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|(matched, branches)| Expr::match_with(matched, branches))
+}
+
 fn expression() -> impl ExprParser + Clone {
     recursive(|expr| {
         let literal = select! {
+            // FIXME: this unwrap may panic (u64 is "finite")
             Token::Int(i) => Expr::Int(i.parse().unwrap()),
             Token::Ident(i) => Expr::Ident(i),
             Token::Str(s) => Expr::Str(s),
@@ -491,12 +533,18 @@ fn expression() -> impl ExprParser + Clone {
         let and = and(element.clone());
         // or
         let or = or(and.clone());
+        let complex = or.clone();
         // if <cond> then <yes> else <no>
-        let if_expr = if_expr(or.clone());
+        let if_expr = if_expr(complex.clone());
+        let complex = complex.or(if_expr);
         // let <pat> = <src> in <target>
-        let let_in = let_in(if_expr.clone().or(or.clone()));
+        let let_in = let_in(complex.clone());
+        let complex = complex.or(let_in);
+        // match
+        let match_expr = match_expr(complex.clone());
+        let complex = complex.or(match_expr);
 
-        choice((if_expr, or, let_in))
+        complex
     })
 }
 
@@ -548,6 +596,10 @@ mod tests {
 
         statement().parse(token_stream)
     }
+
+    /* * * * * * * *
+     * Expressions *
+     * * * * * * * */
 
     #[test]
     fn tokenize_ident_expr() {
@@ -1310,6 +1362,114 @@ else 1
         );
     }
 
+    #[test]
+    fn parse_match_variant_expr() {
+        let src = r#"
+match opt
+| Some x => f x
+| None => None
+        "#;
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::match_with(
+                Expr::ident("opt"),
+                vec![
+                    (
+                        Pattern::variant_with("Some", Pattern::ident("x")),
+                        Expr::app(Expr::ident("f"), Expr::ident("x")),
+                    ),
+                    (Pattern::ident("None"), Expr::ident("None"),),
+                ],
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_match_tuple_expr() {
+        let src = r#"
+match t
+| (x, 0) => -x
+| (0, y) => -y
+| (x, y) => x + y
+
+        "#;
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::match_with(
+                Expr::ident("t"),
+                vec![
+                    (
+                        Pattern::Tuple(vec![
+                            Pattern::ident("x"),
+                            Pattern::Int(0)
+                        ]),
+                        Expr::unary_with(UnOp::Negative, Expr::ident("x")),
+                    ),
+                    (
+                        Pattern::Tuple(vec![
+                            Pattern::Int(0),
+                            Pattern::ident("y")
+                        ]),
+                        Expr::unary_with(UnOp::Negative, Expr::ident("y")),
+                    ),
+                    (
+                        Pattern::Tuple(vec![
+                            Pattern::ident("x"),
+                            Pattern::ident("y"),
+                        ]),
+                        Expr::binop_with(
+                            BinOp::Sum,
+                            Expr::ident("x"),
+                            Expr::ident("y"),
+                        )
+                    ),
+                ],
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_match_nested_expr() {
+        let src = r#"
+match
+    (match t | (x, y) => x + y)
+    | 0 => None
+    | any => Some any
+        "#;
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::match_with(
+                Expr::match_with(
+                    Expr::ident("t"),
+                    vec![(
+                        Pattern::Tuple(vec![
+                            Pattern::ident("x"),
+                            Pattern::ident("y"),
+                        ]),
+                        Expr::binop_with(
+                            BinOp::Sum,
+                            Expr::ident("x"),
+                            Expr::ident("y"),
+                        )
+                    )],
+                ),
+                vec![
+                    (Pattern::Int(0), Expr::ident("None")),
+                    (
+                        Pattern::ident("any"),
+                        Expr::app(Expr::ident("Some"), Expr::ident("any"))
+                    ),
+                ]
+            ))
+        )
+    }
+
+    /* * * * * * * *
+     * Statements  *
+     * * * * * * * */
     #[test]
     fn tokenize_let_stmnt() {
         let src = "let x = 50;";
