@@ -55,6 +55,7 @@ enum Token {
     Else,
     Match,
     MatchArrow,
+    Wildcard,
     // Binders
     Of,
     Is,
@@ -129,6 +130,7 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
 
     let ctrl = choice((
         just("=>").to(Token::MatchArrow),
+        just('_').to(Token::Wildcard),
         just('=').to(Token::Is),
         just(';').to(Token::SemiColon),
         just(',').to(Token::Comma),
@@ -173,10 +175,12 @@ enum BinOp {
 
 #[derive(Debug, PartialEq, Clone)]
 enum Pattern {
+    Wildcard,
     Ident(String),
     Int(u64),
     Tuple(Vec<Self>),
     Variant(String, Box<Self>),
+    Choice(Box<Self>, Box<Self>),
 }
 
 impl Pattern {
@@ -187,6 +191,55 @@ impl Pattern {
     fn variant_with(name: &str, inner: Self) -> Self {
         Self::Variant(name.to_owned(), Box::new(inner))
     }
+
+    fn choice(a: Self, b: Self) -> Self {
+        Self::Choice(Box::new(a), Box::new(b))
+    }
+}
+
+// Parses variant pattern (<Name> <pat>)
+fn variant<P: SubParser<Pattern> + Clone>(
+    pat: P,
+) -> impl SubParser<Pattern> + Clone {
+    select! {Token::Ident(i) => i}
+        .then(pat)
+        .map(|(name, pat)| Pattern::variant_with(&name, pat))
+}
+
+// Parses pattern choice `<pat> | <pat>` (for any amount of choices)
+//
+// Returns pattern `as is` if no choices were found
+fn choice_pat<P: SubParser<Pattern> + Clone>(
+    pat: P,
+) -> impl SubParser<Pattern> + Clone {
+    pat.clone()
+        .then(just(Token::Either).ignore_then(pat).repeated())
+        .foldl(Pattern::choice)
+}
+
+// Parses pattern
+#[allow(clippy::let_and_return)]
+fn pattern() -> impl SubParser<Pattern> + Clone {
+    recursive(|pat| {
+        let literal = select! {
+            // FIXME: this unwrap may panic (u64 is "finite")
+            Token::Int(i) => Pattern::Int(i.parse().unwrap()),
+            Token::Ident(i) => Pattern::Ident(i),
+            Token::Wildcard => Pattern::Wildcard,
+        };
+
+        // Tuple pattern: (a, b, c)
+        let tuple = tuple_like(pat.clone(), Pattern::Tuple);
+        let term = tuple.or(literal);
+        // Variant pattern: <Name> <pat>
+        let variant = variant(term.clone());
+        let term = variant.or(term);
+        // Choice pattern: <pat> | <pat> | <pat>
+        let choice_pat = choice_pat(term.clone());
+        let term = choice_pat;
+
+        term
+    })
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -228,6 +281,10 @@ enum Expr {
 impl Expr {
     fn ident(name: &str) -> Self {
         Self::Ident(name.to_owned())
+    }
+
+    fn string(s: &str) -> Self {
+        Self::Str(s.to_owned())
     }
 
     fn app(f: Self, x: Self) -> Self {
@@ -294,28 +351,10 @@ impl Expr {
     }
 }
 
-// Parses pattern
-fn pattern() -> impl SubParser<Pattern> + Clone {
-    recursive(|pat| {
-        let literal = select! {
-            // FIXME: this unwrap may panic (u64 is "finite")
-            Token::Int(i) => Pattern::Int(i.parse().unwrap()),
-            Token::Ident(i) => Pattern::Ident(i),
-        };
-
-        let tuple = tuple_like(pat.clone(), Pattern::Tuple);
-        let variant = select! {Token::Ident(i) => i}
-            .then(pat.clone())
-            .map(|(name, pat)| Pattern::variant_with(&name, pat));
-
-        choice((variant, tuple, literal))
-    })
-}
-
 // Parses `let <pat> = <expr>` binding
 //
 // Results in `pat` and `expr`
-fn binding<P: ExprParser + Clone>(
+fn let_binding<P: ExprParser + Clone>(
     expr: P,
 ) -> impl SubParser<(Pattern, Expr)> + Clone {
     just(Token::Let)
@@ -332,10 +371,10 @@ fn grouping<P: ExprParser>(expr: P) -> impl ExprParser {
 }
 
 // Parses comma separated items delimited by parens
-fn tuple_like<S, O, F, P>(item: P, f: F) -> impl SubParser<O>
+fn tuple_like<S, O, F, P>(item: P, f: F) -> impl SubParser<O> + Clone
 where
-    F: Fn(Vec<S>) -> O,
-    P: SubParser<S>,
+    F: Fn(Vec<S>) -> O + Clone,
+    P: SubParser<S> + Clone,
 {
     item.separated_by(just(Token::Comma))
         .delimited_by(just(Token::OpenParen), just(Token::CloseParen))
@@ -344,7 +383,7 @@ where
 }
 
 // Parses tuple expression
-fn tuple<P: ExprParser>(term: P) -> impl ExprParser {
+fn tuple<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
     tuple_like(term, Expr::Tuple)
 }
 
@@ -471,7 +510,7 @@ fn if_expr<P: ExprParser + Clone + 'static>(
 
 // Parses let <pat> = <src> in <tgt>
 fn let_in<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
-    binding(term.clone())
+    let_binding(term.clone())
         .then_ignore(just(Token::In))
         .then(term)
         .map(|((pat, src), target)| Expr::letin_with(pat, src, target))
@@ -492,6 +531,7 @@ fn match_expr<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
         .map(|(matched, branches)| Expr::match_with(matched, branches))
 }
 
+#[allow(clippy::let_and_return)]
 fn expression() -> impl ExprParser + Clone {
     recursive(|expr| {
         let literal = select! {
@@ -554,7 +594,7 @@ enum Statement {
 }
 
 fn statement() -> impl SubParser<Statement> {
-    let stmt = binding(expression())
+    let stmt = let_binding(expression())
         .then_ignore(just(Token::SemiColon))
         .map(|(pat, expr)| Statement::Let { pat, expr });
 
@@ -577,22 +617,34 @@ mod tests {
         })
     }
 
-    fn parse_expr(src: &str) -> Result<Expr, Vec<Simple<Token>>> {
-        let tokens = lexer().parse(src).unwrap();
-        let end = src.chars().count();
+    // This could be a function, but I don't want to mess with types
+    macro_rules! tokenize {
+        ($src:expr) => {{
+            let tokens = lexer().parse($src).unwrap();
+            let end = $src.chars().count();
 
-        #[allow(clippy::range_plus_one)]
-        let token_stream = Stream::from_iter(end..end + 1, tokens.into_iter());
+            #[allow(clippy::range_plus_one)]
+            let token_stream =
+                Stream::from_iter(end..end + 1, tokens.into_iter());
+
+            token_stream
+        }};
+    }
+
+    fn parse_pattern(src: &str) -> Result<Pattern, Vec<Simple<Token>>> {
+        let token_stream = tokenize!(src);
+
+        pattern().parse(token_stream)
+    }
+
+    fn parse_expr(src: &str) -> Result<Expr, Vec<Simple<Token>>> {
+        let token_stream = tokenize!(src);
 
         expression().parse(token_stream)
     }
 
     fn parse_stmt(src: &str) -> Result<Statement, Vec<Simple<Token>>> {
-        let tokens = lexer().parse(src).unwrap();
-        let end = src.chars().count();
-
-        #[allow(clippy::range_plus_one)]
-        let token_stream = Stream::from_iter(end..end + 1, tokens.into_iter());
+        let token_stream = tokenize!(src);
 
         statement().parse(token_stream)
     }
@@ -1342,7 +1394,7 @@ else 1
 
     #[test]
     fn tokenize_match_expr() {
-        let src = "match m | Some x => f x | None => None";
+        let src = "match m | Some x => f x | _ => None";
         assert_eq!(
             remove_spans(lexer().parse(src)),
             Ok(vec![
@@ -1355,7 +1407,7 @@ else 1
                 Token::Ident("f".to_owned()),
                 Token::Ident("x".to_owned()),
                 Token::Either,
-                Token::Ident("None".to_owned()),
+                Token::Wildcard,
                 Token::MatchArrow,
                 Token::Ident("None".to_owned()),
             ])
@@ -1382,7 +1434,7 @@ match opt
                     (Pattern::ident("None"), Expr::ident("None"),),
                 ],
             ))
-        )
+        );
     }
 
     #[test]
@@ -1464,7 +1516,99 @@ match
                     ),
                 ]
             ))
-        )
+        );
+    }
+
+    #[test]
+    fn parse_match_wildcard_expr() {
+        let src = r#"
+match e
+| NotFound => "not found"
+| PermissionDenied => "permission error"
+| _ => "unexpected filesystem error"
+        "#;
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::match_with(
+                Expr::ident("e"),
+                vec![
+                    (Pattern::ident("NotFound"), Expr::string("not found")),
+                    (
+                        Pattern::ident("PermissionDenied"),
+                        Expr::string("permission error")
+                    ),
+                    (
+                        Pattern::Wildcard,
+                        Expr::string("unexpected filesystem error")
+                    ),
+                ],
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_match_choice_expr() {
+        let src = r#"
+match element
+| Str _ | Bytes _ => "string-like"
+| _ => "atom-like" 
+        "#;
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::match_with(
+                Expr::ident("element"),
+                vec![
+                    (
+                        Pattern::choice(
+                            Pattern::variant_with("Str", Pattern::Wildcard),
+                            Pattern::variant_with("Bytes", Pattern::Wildcard),
+                        ),
+                        Expr::string("string-like"),
+                    ),
+                    (Pattern::Wildcard, Expr::string("atom-like"))
+                ]
+            ))
+        );
+    }
+
+    /* * * * * * * *
+     * Patterns    *
+     * * * * * * * */
+    #[test]
+    fn parse_choice_pattern() {
+        let src = "0 | 1 | 5";
+
+        assert_eq!(
+            parse_pattern(src),
+            Ok(Pattern::choice(
+                Pattern::choice(Pattern::Int(0), Pattern::Int(1),),
+                Pattern::Int(5),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_choice_deep_pattern() {
+        let src = "Empty | Str (Just _, _) | Bytes _";
+
+        assert_eq!(
+            parse_pattern(src),
+            Ok(Pattern::choice(
+                Pattern::choice(
+                    Pattern::ident("Empty"),
+                    Pattern::variant_with(
+                        "Str",
+                        Pattern::Tuple(vec![
+                            Pattern::variant_with("Just", Pattern::Wildcard),
+                            Pattern::Wildcard,
+                        ])
+                    )
+                ),
+                Pattern::variant_with("Bytes", Pattern::Wildcard)
+            ))
+        );
     }
 
     /* * * * * * * *
@@ -1493,6 +1637,36 @@ match
             Ok(Statement::Let {
                 pat: Pattern::ident("x"),
                 expr: Expr::Int(50),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_let_unit_stmt() {
+        let src = r#"
+let () = print "wow";
+        "#;
+
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::Let {
+                pat: Pattern::Tuple(vec![]),
+                expr: Expr::app(Expr::ident("print"), Expr::string("wow")),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_let_discard_stmt() {
+        let src = r#"
+let _ = rm "tmp.kf";
+        "#;
+
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::Let {
+                pat: Pattern::Wildcard,
+                expr: Expr::app(Expr::ident("rm"), Expr::string("tmp.kf")),
             })
         );
     }
