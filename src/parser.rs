@@ -217,29 +217,61 @@ fn choice_pat<P: SubParser<Pattern> + Clone>(
         .foldl(Pattern::choice)
 }
 
-// Parses pattern
+// Artificial spilt of pattern handler
+//
+// Parses "atomic" patterns like ints, identifiers, wildcards,
+// tuples
+fn atomic_pattern<P: SubParser<Pattern> + Clone>(
+    pat: P,
+) -> impl SubParser<Pattern> + Clone {
+    let literal = select! {
+        // FIXME: this unwrap may panic (u64 is "finite")
+        Token::Int(i) => Pattern::Int(i.parse().unwrap()),
+        Token::Ident(i) => Pattern::Ident(i),
+        Token::Wildcard => Pattern::Wildcard,
+    };
+
+    // Grouping
+    let grouping = grouping(pat.clone());
+
+    // Tuple pattern: (a, b, c)
+    let tuple = tuple_like(pat, Pattern::Tuple);
+    grouping.or(tuple).or(literal)
+}
+
+// Artificial spilt of pattern handler
+//
+// Parses "free" patterns like variants or choice patterns
 #[allow(clippy::let_and_return)]
+fn complex_pattern<P: SubParser<Pattern> + Clone>(
+    pat: P,
+) -> impl SubParser<Pattern> + Clone {
+    // Variant pattern: <Name> <pat>
+    let variant = variant(pat.clone());
+    let term = variant.or(pat);
+    // Choice pattern: <pat> | <pat> | <pat>
+    let choice_pat = choice_pat(term);
+    let term = choice_pat;
+
+    term
+}
+
+// Parses pattern
+//
+// Split in two parts, so that abstraction syntax can be described using
+// atomic and complex part in unambiguous way
 fn pattern() -> impl SubParser<Pattern> + Clone {
     recursive(|pat| {
-        let literal = select! {
-            // FIXME: this unwrap may panic (u64 is "finite")
-            Token::Int(i) => Pattern::Int(i.parse().unwrap()),
-            Token::Ident(i) => Pattern::Ident(i),
-            Token::Wildcard => Pattern::Wildcard,
-        };
+        let atom = atomic_pattern(pat.clone());
 
-        // Tuple pattern: (a, b, c)
-        let tuple = tuple_like(pat.clone(), Pattern::Tuple);
-        let term = tuple.or(literal);
-        // Variant pattern: <Name> <pat>
-        let variant = variant(term.clone());
-        let term = variant.or(term);
-        // Choice pattern: <pat> | <pat> | <pat>
-        let choice_pat = choice_pat(term.clone());
-        let term = choice_pat;
-
-        term
+        complex_pattern(atom.clone())
     })
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum LetBind {
+    Abstraction(String, Vec<Pattern>),
+    Bound(Pattern),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -263,9 +295,9 @@ enum Expr {
         // TODO: make optional?
         no: Box<Self>,
     },
-    // let <pat> = <src> in <target>
+    // let <bind> = <src> in <target>
     LetIn {
-        pat: Pattern,
+        bind: LetBind,
         src: Box<Self>,
         target: Box<Self>,
     },
@@ -335,12 +367,29 @@ impl Expr {
         }
     }
 
-    fn letin_with(pat: Pattern, src: Self, target: Self) -> Self {
+    fn letin_with(bind: LetBind, src: Self, target: Self) -> Self {
         Self::LetIn {
-            pat,
+            bind,
             src: Box::new(src),
             target: Box::new(target),
         }
+    }
+
+    fn let_bound_in(pat: Pattern, src: Self, target: Self) -> Self {
+        Self::letin_with(LetBind::Bound(pat), src, target)
+    }
+
+    fn let_abstraction_in(
+        name: &str,
+        args: Vec<Pattern>,
+        src: Self,
+        target: Self,
+    ) -> Self {
+        Self::letin_with(
+            LetBind::Abstraction(name.to_owned(), args),
+            src,
+            target,
+        )
     }
 
     fn match_with(matched: Self, branches: Vec<(Pattern, Self)>) -> Self {
@@ -351,22 +400,54 @@ impl Expr {
     }
 }
 
-// Parses `let <pat> = <expr>` binding
+// Parses `let <bind> = <expr>` binding using parser for bind
+fn let_binding_maker<B, E>(
+    bind: B,
+    expr: E,
+) -> impl SubParser<(LetBind, Expr)> + Clone
+where
+    B: SubParser<LetBind> + Clone,
+    E: ExprParser + Clone,
+{
+    just(Token::Let)
+        .ignore_then(bind)
+        .then_ignore(just(Token::Is))
+        .then(expr)
+}
+
+// Parses `let <declaration> = <src>` binding
 //
 // Results in `pat` and `expr`
 fn let_binding<P: ExprParser + Clone>(
     expr: P,
-) -> impl SubParser<(Pattern, Expr)> + Clone {
-    just(Token::Let)
-        .ignore_then(pattern())
-        .then_ignore(just(Token::Is))
-        .then(expr)
+) -> impl SubParser<(LetBind, Expr)> + Clone {
+    // used for things like
+    // `let x = 5`
+    // `let (x, y) = (5, 10);
+    let bound = pattern().map(LetBind::Bound);
+
+    // used for "function" declaration
+    let abstraction = select! { Token::Ident(i) => i}
+        .then(
+            atomic_pattern(pattern())
+                .or(complex_pattern(pattern()).delimited_by(
+                    just(Token::OpenParen),
+                    just(Token::CloseParen),
+                ))
+                .repeated()
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|(name, args)| LetBind::Abstraction(name, args));
+
+    let_binding_maker(abstraction, expr.clone())
+        .or(let_binding_maker(bound, expr))
 }
 
 // Parses grouped expression
 //
 // Result in whatever Expr were inside parens
-fn grouping<P: ExprParser>(expr: P) -> impl ExprParser {
+fn grouping<I, P: SubParser<I> + Clone>(expr: P) -> impl SubParser<I> + Clone {
     expr.delimited_by(just(Token::OpenParen), just(Token::CloseParen))
 }
 
@@ -590,13 +671,29 @@ fn expression() -> impl ExprParser + Clone {
 
 #[derive(Debug, PartialEq, Clone)]
 enum Statement {
-    Let { pat: Pattern, expr: Expr },
+    Let { bind: LetBind, expr: Expr },
+}
+
+impl Statement {
+    fn let_bound(pat: Pattern, expr: Expr) -> Self {
+        Self::Let {
+            bind: LetBind::Bound(pat),
+            expr,
+        }
+    }
+
+    fn let_abstraction(name: &str, args: Vec<Pattern>, expr: Expr) -> Self {
+        Self::Let {
+            bind: LetBind::Abstraction(name.to_owned(), args),
+            expr,
+        }
+    }
 }
 
 fn statement() -> impl SubParser<Statement> {
     let stmt = let_binding(expression())
         .then_ignore(just(Token::SemiColon))
-        .map(|(pat, expr)| Statement::Let { pat, expr });
+        .map(|(bind, expr)| Statement::Let { bind, expr });
 
     stmt.then_ignore(end())
 }
@@ -818,6 +915,21 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::app(Expr::ident("next"), Expr::Int(25))),
+        );
+    }
+
+    #[test]
+    fn parse_call_deep_expr() {
+        let src = "chain next next 5";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::app(
+                Expr::app(
+                    Expr::app(Expr::ident("chain"), Expr::ident("next")),
+                    Expr::ident("next"),
+                ),
+                Expr::Int(5),
+            ))
         );
     }
 
@@ -1340,7 +1452,7 @@ else 1
         let src = "let x = 5 in Some x";
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::letin_with(
+            Ok(Expr::let_bound_in(
                 Pattern::ident("x"),
                 Expr::Int(5),
                 Expr::app(Expr::ident("Some"), Expr::ident("x"))
@@ -1353,7 +1465,7 @@ else 1
         let src = "let (x, y) = (5, 10) in x + y";
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::letin_with(
+            Ok(Expr::let_bound_in(
                 Pattern::Tuple(vec![Pattern::ident("x"), Pattern::ident("y")]),
                 Expr::Tuple(vec![Expr::Int(5), Expr::Int(10)]),
                 Expr::binop_with(
@@ -1370,7 +1482,7 @@ else 1
         let src = "let (x, (y, z)) = pack in x + y + z";
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::letin_with(
+            Ok(Expr::let_bound_in(
                 Pattern::Tuple(vec![
                     Pattern::ident("x"),
                     Pattern::Tuple(vec![
@@ -1389,6 +1501,141 @@ else 1
                     Expr::ident("z"),
                 )
             )),
+        );
+    }
+
+    #[test]
+    fn parse_let_in_abstraction_expr() {
+        let src = r#"
+let chain f g x = g (f x)
+    in
+chain next next 5
+        "#;
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::let_abstraction_in(
+                "chain",
+                vec![
+                    Pattern::ident("f"),
+                    Pattern::ident("g"),
+                    Pattern::ident("x"),
+                ],
+                Expr::app(
+                    Expr::ident("g"),
+                    Expr::app(Expr::ident("f"), Expr::ident("x"))
+                ),
+                Expr::app(
+                    Expr::app(
+                        Expr::app(Expr::ident("chain"), Expr::ident("next")),
+                        Expr::ident("next"),
+                    ),
+                    Expr::Int(5),
+                ),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_let_in_abstraction_with_pattern_expr() {
+        let src = r#"
+let add (x, y) = x + y
+    in
+add (5, 10)
+        "#;
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::let_abstraction_in(
+                "add",
+                vec![Pattern::Tuple(vec![
+                    Pattern::ident("x"),
+                    Pattern::ident("y"),
+                ]),],
+                Expr::binop_with(
+                    BinOp::Sum,
+                    Expr::ident("x"),
+                    Expr::ident("y"),
+                ),
+                Expr::app(
+                    Expr::ident("add"),
+                    Expr::Tuple(vec![Expr::Int(5), Expr::Int(10)]),
+                ),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_let_in_abstraction_with_complex_pattern_expr() {
+        // Tbh, it's unclear whether that code actually correct.
+        //
+        // In following code, we can see that match is practically valid.
+        // Though if we de-sugar this to match (and we probably should),
+        // we can see that `Some y` is not exhaustive match, considering
+        // that we probably match `option`, nor is `10` pattern.
+        //
+        // But from parser pespective code like `let 5 = 5` is valid.
+        // And considering the fact that let-binding for abstraction does
+        // use pattern() in slightly different way from `match`
+        // we want to be sure that even this code can be *correctly* parsed.
+        let src = r#"
+let f x (Some y) (One z | Two z) (a, Some b) 10 _ = x + y + z + a + b
+    in
+f 5 (Some 6) (One 8) (5, 10) 10 "whatever"
+        "#;
+
+        let args = vec![
+            Pattern::ident("x"),
+            Pattern::variant_with("Some", Pattern::ident("y")),
+            Pattern::choice(
+                Pattern::variant_with("One", Pattern::ident("z")),
+                Pattern::variant_with("Two", Pattern::ident("z")),
+            ),
+            Pattern::Tuple(vec![
+                Pattern::ident("a"),
+                Pattern::variant_with("Some", Pattern::ident("b")),
+            ]),
+            Pattern::Int(10),
+            Pattern::Wildcard,
+        ];
+
+        let expr = Expr::binop_with(
+            BinOp::Sum,
+            Expr::binop_with(
+                BinOp::Sum,
+                Expr::binop_with(
+                    BinOp::Sum,
+                    Expr::binop_with(
+                        BinOp::Sum,
+                        Expr::ident("x"),
+                        Expr::ident("y"),
+                    ),
+                    Expr::ident("z"),
+                ),
+                Expr::ident("a"),
+            ),
+            Expr::ident("b"),
+        );
+
+        let target = Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::app(
+                        Expr::app(
+                            Expr::app(Expr::ident("f"), Expr::Int(5)),
+                            Expr::app(Expr::ident("Some"), Expr::Int(6)),
+                        ),
+                        Expr::app(Expr::ident("One"), Expr::Int(8)),
+                    ),
+                    Expr::Tuple(vec![Expr::Int(5), Expr::Int(10)]),
+                ),
+                Expr::Int(10),
+            ),
+            Expr::string("whatever"),
+        );
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::let_abstraction_in("f", args, expr, target))
         );
     }
 
@@ -1634,10 +1881,7 @@ match element
         let src = "let x = 50;";
         assert_eq!(
             parse_stmt(src),
-            Ok(Statement::Let {
-                pat: Pattern::ident("x"),
-                expr: Expr::Int(50),
-            })
+            Ok(Statement::let_bound(Pattern::ident("x"), Expr::Int(50)))
         );
     }
 
@@ -1649,10 +1893,10 @@ let () = print "wow";
 
         assert_eq!(
             parse_stmt(src),
-            Ok(Statement::Let {
-                pat: Pattern::Tuple(vec![]),
-                expr: Expr::app(Expr::ident("print"), Expr::string("wow")),
-            })
+            Ok(Statement::let_bound(
+                Pattern::Tuple(vec![]),
+                Expr::app(Expr::ident("print"), Expr::string("wow")),
+            ))
         );
     }
 
@@ -1664,10 +1908,24 @@ let _ = rm "tmp.kf";
 
         assert_eq!(
             parse_stmt(src),
-            Ok(Statement::Let {
-                pat: Pattern::Wildcard,
-                expr: Expr::app(Expr::ident("rm"), Expr::string("tmp.kf")),
-            })
+            Ok(Statement::let_bound(
+                Pattern::Wildcard,
+                Expr::app(Expr::ident("rm"), Expr::string("tmp.kf")),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_let_abstraction_stmt() {
+        let src = "let neg x = - x;";
+
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::let_abstraction(
+                "neg",
+                vec![Pattern::ident("x")],
+                Expr::unary_with(UnOp::Negative, Expr::ident("x"))
+            ))
         );
     }
 
