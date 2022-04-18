@@ -1,6 +1,5 @@
 #![warn(clippy::pedantic)]
-#![allow(unused)]
-use chumsky::prelude::*;
+use chumsky::{prelude::*, Stream};
 
 // aliases
 trait ExprParser: Parser<Token, Expr, Error = Simple<Token>> {}
@@ -153,12 +152,12 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum UnOp {
+pub enum UnOp {
     Negative,
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum BinOp {
+pub enum BinOp {
     // arithmetic
     Sum,
     Sub,
@@ -174,7 +173,7 @@ enum BinOp {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum Pattern {
+pub enum Pattern {
     Wildcard,
     Ident(String),
     Int(u64),
@@ -184,6 +183,7 @@ enum Pattern {
 }
 
 impl Pattern {
+    #[cfg(test)]
     fn ident(name: &str) -> Self {
         Self::Ident(name.to_owned())
     }
@@ -236,22 +236,26 @@ fn atomic_pattern<P: SubParser<Pattern> + Clone>(
 
     // Tuple pattern: (a, b, c)
     let tuple = tuple_like(pat, Pattern::Tuple);
-    grouping.or(tuple).or(literal)
+    choice((grouping, tuple, literal))
 }
 
 // Artificial spilt of pattern handler
 //
 // Parses "free" patterns like variants or choice patterns
 #[allow(clippy::let_and_return)]
-fn complex_pattern<P: SubParser<Pattern> + Clone>(
+fn complex_pattern<P: SubParser<Pattern> + Clone + 'static>(
     pat: P,
 ) -> impl SubParser<Pattern> + Clone {
     // Variant pattern: <Name> <pat>
     let variant = variant(pat.clone());
     let term = variant.or(pat);
+    #[cfg(debug_assertions)]
+    let term = term.boxed();
     // Choice pattern: <pat> | <pat> | <pat>
     let choice_pat = choice_pat(term);
     let term = choice_pat;
+    #[cfg(debug_assertions)]
+    let term = term.boxed();
 
     term
 }
@@ -264,18 +268,25 @@ fn pattern() -> impl SubParser<Pattern> + Clone {
     recursive(|pat| {
         let atom = atomic_pattern(pat.clone());
 
-        complex_pattern(atom.clone())
+        #[cfg(debug_assertions)]
+        let atom = atom.boxed();
+
+        let complex = complex_pattern(atom.clone());
+        #[cfg(debug_assertions)]
+        let complex = complex.boxed();
+
+        complex
     })
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum LetBind {
+pub enum LetBind {
     Abstraction(String, Vec<Pattern>),
     Bound(Pattern),
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum Expr {
+pub enum Expr {
     // Atoms
     Int(u64),
     Ident(String),
@@ -311,10 +322,12 @@ enum Expr {
 }
 
 impl Expr {
+    #[cfg(test)]
     fn ident(name: &str) -> Self {
         Self::Ident(name.to_owned())
     }
 
+    #[cfg(test)]
     fn string(s: &str) -> Self {
         Self::Str(s.to_owned())
     }
@@ -375,10 +388,12 @@ impl Expr {
         }
     }
 
+    #[cfg(test)]
     fn let_bound_in(pat: Pattern, src: Self, target: Self) -> Self {
         Self::letin_with(LetBind::Bound(pat), src, target)
     }
 
+    #[cfg(test)]
     fn let_abstraction_in(
         name: &str,
         args: Vec<Pattern>,
@@ -439,6 +454,9 @@ fn let_binding<P: ExprParser + Clone>(
                 .collect::<Vec<_>>(),
         )
         .map(|(name, args)| LetBind::Abstraction(name, args));
+
+    #[cfg(debug_assertions)]
+    let abstraction = abstraction.boxed();
 
     let_binding_maker(abstraction, expr.clone())
         .or(let_binding_maker(bound, expr))
@@ -655,26 +673,36 @@ fn expression() -> impl ExprParser + Clone {
         // or
         let or = or(and.clone());
         let complex = or.clone();
+        #[cfg(debug_assertions)]
+        let complex = complex.boxed();
         // if <cond> then <yes> else <no>
         let if_expr = if_expr(complex.clone());
         let complex = complex.or(if_expr);
+        #[cfg(debug_assertions)]
+        let complex = complex.boxed();
         // let <pat> = <src> in <target>
         let let_in = let_in(complex.clone());
         let complex = complex.or(let_in);
+        #[cfg(debug_assertions)]
+        let complex = complex.boxed();
         // match
         let match_expr = match_expr(complex.clone());
         let complex = complex.or(match_expr);
+        #[cfg(debug_assertions)]
+        let complex = complex.boxed();
 
         complex
     })
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum Statement {
+pub enum Statement {
     Let { bind: LetBind, expr: Expr },
+    ModuleStruct(String, Vec<Self>),
 }
 
 impl Statement {
+    #[cfg(test)]
     fn let_bound(pat: Pattern, expr: Expr) -> Self {
         Self::Let {
             bind: LetBind::Bound(pat),
@@ -682,36 +710,76 @@ impl Statement {
         }
     }
 
+    #[cfg(test)]
     fn let_abstraction(name: &str, args: Vec<Pattern>, expr: Expr) -> Self {
         Self::Let {
             bind: LetBind::Abstraction(name.to_owned(), args),
             expr,
         }
     }
+
+    #[cfg(test)]
+    fn module_struct(name: &str, defs: Vec<Self>) -> Self {
+        Self::ModuleStruct(name.to_owned(), defs)
+    }
 }
 
 fn statement() -> impl SubParser<Statement> {
-    let stmt = let_binding(expression())
-        .then_ignore(just(Token::SemiColon))
-        .map(|(bind, expr)| Statement::Let { bind, expr });
+    recursive(|stmt| {
+        let let_stmt = let_binding(expression())
+            .then_ignore(just(Token::SemiColon))
+            .map(|(bind, expr)| Statement::Let { bind, expr });
 
-    stmt.then_ignore(end())
+        let module = just(Token::Module)
+            .ignore_then(select! {Token::Ident(i) => i})
+            .then_ignore(just(Token::Is))
+            .then_ignore(just(Token::Struct))
+            .then(stmt.repeated())
+            .then_ignore(just(Token::End))
+            .map(|(name, defs)| Statement::ModuleStruct(name, defs));
+
+        let_stmt.or(module)
+    })
+}
+
+fn ast_parser() -> impl SubParser<Vec<(Statement, Span)>> {
+    statement()
+        .map_with_span(|stmt, span| (stmt, span))
+        .repeated()
+        .collect::<Vec<_>>()
+        .then_ignore(end())
+}
+
+#[derive(Debug)]
+pub struct Ast {
+    pub defs: Vec<(Statement, Span)>,
+}
+
+impl Ast {
+    /// Parse all definitions from file
+    ///
+    /// # Panics
+    /// If file contains invalid code, this function will panic
+    #[must_use]
+    pub fn parse_expect(src: &str) -> Self {
+        let tokens = lexer().parse(src).unwrap();
+        let end = src.chars().count();
+
+        #[allow(clippy::range_plus_one)]
+        let token_stream = Stream::from_iter(end..end + 1, tokens.into_iter());
+
+        let defs = ast_parser().parse(token_stream).unwrap();
+
+        Self { defs }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chumsky::Stream;
 
     fn remove_spans<X, E>(tt: Result<Vec<(X, Span)>, E>) -> Result<Vec<X>, E> {
         tt.map(|tt| tt.into_iter().map(|(t, _s)| t).collect())
-    }
-
-    fn remove_span<X, E>(x: Result<(X, Span), E>) -> Result<X, E> {
-        x.map(|i| {
-            let (x, _s) = i;
-            x
-        })
     }
 
     // This could be a function, but I don't want to mess with types
@@ -2067,6 +2135,43 @@ end
                 // end of module declaration
                 Token::End,
             ])
+        );
+    }
+
+    #[test]
+    fn parse_module_stmt() {
+        let src = r#"
+module Ops = struct
+    let add x y = x + y;
+    let sub x y = x - y;
+end
+        "#;
+
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::module_struct(
+                "Ops",
+                vec![
+                    Statement::let_abstraction(
+                        "add",
+                        vec![Pattern::ident("x"), Pattern::ident("y")],
+                        Expr::binop_with(
+                            BinOp::Sum,
+                            Expr::ident("x"),
+                            Expr::ident("y"),
+                        )
+                    ),
+                    Statement::let_abstraction(
+                        "sub",
+                        vec![Pattern::ident("x"), Pattern::ident("y")],
+                        Expr::binop_with(
+                            BinOp::Sub,
+                            Expr::ident("x"),
+                            Expr::ident("y"),
+                        )
+                    ),
+                ]
+            ))
         );
     }
 }
