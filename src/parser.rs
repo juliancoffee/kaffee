@@ -2,13 +2,98 @@
 use chumsky::{prelude::*, Stream};
 
 // aliases
-trait ExprParser: Parser<Token, Expr, Error = Simple<Token>> {}
-impl<T> ExprParser for T where T: Parser<Token, Expr, Error = Simple<Token>> {}
+trait ExprParser: Parser<Token, Spanned<Expr>, Error = Simple<Token>> {}
+impl<T> ExprParser for T where
+    T: Parser<Token, Spanned<Expr>, Error = Simple<Token>>
+{
+}
 
 trait SubParser<O>: Parser<Token, O, Error = Simple<Token>> {}
 impl<T, O> SubParser<O> for T where T: Parser<Token, O, Error = Simple<Token>> {}
 
 type Span = std::ops::Range<usize>;
+
+// We probably don't want spans in tests.
+// If we will want, we may add feature like [span-test] and write tests with it
+#[cfg(test)]
+pub type Spanned<T> = T;
+
+#[cfg(not(test))]
+#[derive(Debug, PartialEq, Clone)]
+pub struct Spanned<T> {
+    item: T,
+    span: Span,
+}
+
+#[cfg(not(test))]
+impl<T> Spanned<T> {
+    fn new(item: T, span: Span) -> Self {
+        Self { item, span }
+    }
+
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+
+    pub fn to_item(&self) -> &T {
+        &self.item
+    }
+
+    pub fn into_item(self) -> T {
+        self.item
+    }
+
+    fn reach<O>(&self, other: &Spanned<O>) -> Span {
+        let start = self.span().start;
+        let end = other.span().end;
+
+        start..end
+    }
+
+    fn transfer<O>(self, other: O) -> Spanned<O> {
+        spanned(other, self.span)
+    }
+}
+
+#[cfg(not(test))]
+fn spanned<T>(item: T, span: Span) -> Spanned<T> {
+    Spanned::new(item, span)
+}
+
+#[cfg(not(test))]
+fn transfer_span<T, R>(t: Spanned<T>, r: R) -> Spanned<R> {
+    t.transfer(r)
+}
+
+#[cfg(not(test))]
+fn lookup<T>(s: &Spanned<T>) -> &T {
+    s.to_item()
+}
+
+#[cfg(not(test))]
+fn unspan<T>(s: Spanned<T>) -> T {
+    s.into_item()
+}
+
+#[cfg(test)]
+fn spanned<T>(item: T, _: Span) -> Spanned<T> {
+    item
+}
+
+#[cfg(test)]
+fn transfer_span<T, R>(_: Spanned<T>, r: R) -> Spanned<R> {
+    r
+}
+
+#[cfg(test)]
+fn lookup<T>(s: &Spanned<T>) -> &T {
+    s
+}
+
+#[cfg(test)]
+fn unspan<T>(s: Spanned<T>) -> T {
+    s
+}
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 enum Op {
@@ -36,6 +121,8 @@ enum Op {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 enum Token {
+    // Misc
+    Doc(String),
     // Words
     Int(String),
     Str(String),
@@ -84,6 +171,17 @@ impl Token {
 }
 
 fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
+    let row_comment = just("//")
+        .ignore_then(take_until(text::newline()))
+        .map(|(line, ())| line.into_iter().skip_while(|c| c.is_whitespace()))
+        .collect::<String>();
+
+    let doc = row_comment
+        .repeated()
+        .at_least(1)
+        .collect::<String>()
+        .map(Token::Doc);
+
     let int = text::int(10).map(Token::Int);
     let string = just('"')
         .ignore_then(filter(|c| *c != '"').repeated())
@@ -142,7 +240,7 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         just('}').to(Token::CloseBrace),
     ));
 
-    let token = choice((atom, op, ctrl, marked, word));
+    let token = choice((doc, atom, op, ctrl, marked, word));
 
     token
         .map_with_span(|tok, span| (tok, span))
@@ -177,9 +275,9 @@ pub enum Pattern {
     Wildcard,
     Ident(String),
     Int(u64),
-    Tuple(Vec<Self>),
-    Variant(String, Box<Self>),
-    Choice(Box<Self>, Box<Self>),
+    Tuple(Vec<Spanned<Self>>),
+    Variant(String, Box<Spanned<Self>>),
+    Choice(Box<Spanned<Self>>, Box<Spanned<Self>>),
 }
 
 impl Pattern {
@@ -188,30 +286,43 @@ impl Pattern {
         Self::Ident(name.to_owned())
     }
 
-    fn variant_with(name: &str, inner: Self) -> Self {
+    fn variant(name: String, inner: Spanned<Self>) -> Self {
+        Self::Variant(name, Box::new(inner))
+    }
+
+    #[cfg(test)]
+    fn variant_with(name: &str, inner: Spanned<Self>) -> Self {
         Self::Variant(name.to_owned(), Box::new(inner))
     }
 
-    fn choice(a: Self, b: Self) -> Self {
-        Self::Choice(Box::new(a), Box::new(b))
+    fn choice(a: Spanned<Self>, b: Spanned<Self>) -> Spanned<Self> {
+        #[cfg(not(test))]
+        let span = a.reach(&b);
+        #[cfg(test)]
+        let span = 0..0;
+
+        let choice = Self::Choice(Box::new(a), Box::new(b));
+
+        spanned(choice, span)
     }
 }
 
 // Parses variant pattern (<Name> <pat>)
-fn variant<P: SubParser<Pattern> + Clone>(
+fn variant<P: SubParser<Spanned<Pattern>> + Clone>(
     pat: P,
-) -> impl SubParser<Pattern> + Clone {
+) -> impl SubParser<Spanned<Pattern>> + Clone {
     select! {Token::Ident(i) => i}
         .then(pat)
-        .map(|(name, pat)| Pattern::variant_with(&name, pat))
+        .map(|(name, pat)| Pattern::variant(name, pat))
+        .map_with_span(spanned)
 }
 
 // Parses pattern choice `<pat> | <pat>` (for any amount of choices)
 //
 // Returns pattern `as is` if no choices were found
-fn choice_pat<P: SubParser<Pattern> + Clone>(
+fn choice_pat<P: SubParser<Spanned<Pattern>> + Clone>(
     pat: P,
-) -> impl SubParser<Pattern> + Clone {
+) -> impl SubParser<Spanned<Pattern>> + Clone {
     pat.clone()
         .then(just(Token::Either).ignore_then(pat).repeated())
         .foldl(Pattern::choice)
@@ -221,21 +332,22 @@ fn choice_pat<P: SubParser<Pattern> + Clone>(
 //
 // Parses "atomic" patterns like ints, identifiers, wildcards,
 // tuples
-fn atomic_pattern<P: SubParser<Pattern> + Clone>(
+fn atomic_pattern<P: SubParser<Spanned<Pattern>> + Clone>(
     pat: P,
-) -> impl SubParser<Pattern> + Clone {
+) -> impl SubParser<Spanned<Pattern>> + Clone {
     let literal = select! {
         // FIXME: this unwrap may panic (u64 is "finite")
         Token::Int(i) => Pattern::Int(i.parse().unwrap()),
         Token::Ident(i) => Pattern::Ident(i),
         Token::Wildcard => Pattern::Wildcard,
     };
+    let literal = literal.map_with_span(spanned);
 
     // Grouping
     let grouping = grouping(pat.clone());
 
     // Tuple pattern: (a, b, c)
-    let tuple = tuple_like(pat, Pattern::Tuple);
+    let tuple = tuple_like(pat, Pattern::Tuple).map_with_span(spanned);
     choice((grouping, tuple, literal))
 }
 
@@ -243,9 +355,9 @@ fn atomic_pattern<P: SubParser<Pattern> + Clone>(
 //
 // Parses "free" patterns like variants or choice patterns
 #[allow(clippy::let_and_return)]
-fn complex_pattern<P: SubParser<Pattern> + Clone + 'static>(
+fn complex_pattern<P: SubParser<Spanned<Pattern>> + Clone + 'static>(
     pat: P,
-) -> impl SubParser<Pattern> + Clone {
+) -> impl SubParser<Spanned<Pattern>> + Clone {
     // Variant pattern: <Name> <pat>
     let variant = variant(pat.clone());
     let term = variant.or(pat);
@@ -264,7 +376,7 @@ fn complex_pattern<P: SubParser<Pattern> + Clone + 'static>(
 //
 // Split in two parts, so that abstraction syntax can be described using
 // atomic and complex part in unambiguous way
-fn pattern() -> impl SubParser<Pattern> + Clone {
+fn pattern() -> impl SubParser<Spanned<Pattern>> + Clone {
     recursive(|pat| {
         let atom = atomic_pattern(pat.clone());
 
@@ -281,8 +393,8 @@ fn pattern() -> impl SubParser<Pattern> + Clone {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum LetBind {
-    Abstraction(String, Vec<Pattern>),
-    Bound(Pattern),
+    Abstraction(String, Vec<Spanned<Pattern>>),
+    Bound(Spanned<Pattern>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -292,32 +404,32 @@ pub enum Expr {
     Ident(String),
     Str(String),
     // Collections
-    List(Vec<Self>),
-    Tuple(Vec<Self>),
+    List(Vec<Spanned<Self>>),
+    Tuple(Vec<Spanned<Self>>),
     // Complex
-    Unary(UnOp, Box<Self>),
-    BinOp(BinOp, Box<Self>, Box<Self>),
-    App(Box<Self>, Box<Self>),
+    Unary(UnOp, Box<Spanned<Self>>),
+    BinOp(BinOp, Box<Spanned<Self>>, Box<Spanned<Self>>),
+    App(Box<Spanned<Self>>, Box<Spanned<Self>>),
     // Compound
     // if <cond> then <yes> else <no>
     If {
-        cond: Box<Self>,
-        yes: Box<Self>,
+        cond: Box<Spanned<Self>>,
+        yes: Box<Spanned<Self>>,
         // TODO: make optional?
-        no: Box<Self>,
+        no: Box<Spanned<Self>>,
     },
     // let <bind> = <src> in <target>
     LetIn {
-        bind: LetBind,
-        src: Box<Self>,
-        target: Box<Self>,
+        bind: Spanned<LetBind>,
+        src: Box<Spanned<Self>>,
+        target: Box<Spanned<Self>>,
     },
     // match <matched>
     //   | <pat> => <target>
     //   ...
     Match {
-        matched: Box<Self>,
-        branches: Vec<(Pattern, Self)>,
+        matched: Box<Spanned<Self>>,
+        branches: Vec<(Spanned<Pattern>, Spanned<Self>)>,
     },
 }
 
@@ -332,26 +444,40 @@ impl Expr {
         Self::Str(s.to_owned())
     }
 
-    fn app(f: Self, x: Self) -> Self {
-        Self::App(Box::new(f), Box::new(x))
+    fn app(f: Spanned<Self>, x: Spanned<Self>) -> Spanned<Self> {
+        #[cfg(not(test))]
+        let span = f.reach(&x);
+        #[cfg(test)]
+        let span = 0..0;
+        spanned(Self::App(Box::new(f), Box::new(x)), span)
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn make_unary(token: Token, x: Self) -> Self {
-        let op = token.op_expect();
+    fn make_unary(token: Spanned<Token>, x: Spanned<Self>) -> Spanned<Self> {
+        let op = lookup(&token).op_expect();
         let unary = match op {
             Op::Minus => UnOp::Negative,
             _ => unreachable!(),
         };
-        Self::unary_with(unary, x)
+
+        Self::unary_with(transfer_span(token, unary), x)
     }
 
-    fn unary_with(op: UnOp, x: Self) -> Self {
-        Self::Unary(op, Box::new(x))
+    fn unary_with(op: Spanned<UnOp>, x: Spanned<Self>) -> Spanned<Self> {
+        #[cfg(not(test))]
+        let span = op.reach(&x);
+        #[cfg(test)]
+        let span = 0..0;
+
+        spanned(Self::Unary(unspan(op), Box::new(x)), span)
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn make_binop(token: Token, x: Self, y: Self) -> Self {
+    fn make_binop(
+        token: Token,
+        x: Spanned<Self>,
+        y: Spanned<Self>,
+    ) -> Spanned<Self> {
         let op = token.op_expect();
         let binop = match op {
             Op::Minus => BinOp::Sub,
@@ -368,11 +494,23 @@ impl Expr {
         Self::binop_with(binop, x, y)
     }
 
-    fn binop_with(op: BinOp, x: Self, y: Self) -> Self {
-        Self::BinOp(op, Box::new(x), Box::new(y))
+    fn binop_with(
+        op: BinOp,
+        x: Spanned<Self>,
+        y: Spanned<Self>,
+    ) -> Spanned<Self> {
+        #[cfg(not(test))]
+        let span = x.reach(&y);
+        #[cfg(test)]
+        let span = 0..0;
+        spanned(Self::BinOp(op, Box::new(x), Box::new(y)), span)
     }
 
-    fn if_with(cond: Self, then: Self, otherwise: Self) -> Self {
+    fn if_with(
+        cond: Spanned<Self>,
+        then: Spanned<Self>,
+        otherwise: Spanned<Self>,
+    ) -> Self {
         Self::If {
             cond: Box::new(cond),
             yes: Box::new(then),
@@ -380,7 +518,11 @@ impl Expr {
         }
     }
 
-    fn letin_with(bind: LetBind, src: Self, target: Self) -> Self {
+    fn letin_with(
+        bind: Spanned<LetBind>,
+        src: Spanned<Self>,
+        target: Spanned<Self>,
+    ) -> Self {
         Self::LetIn {
             bind,
             src: Box::new(src),
@@ -407,7 +549,10 @@ impl Expr {
         )
     }
 
-    fn match_with(matched: Self, branches: Vec<(Pattern, Self)>) -> Self {
+    fn match_with(
+        matched: Spanned<Self>,
+        branches: Vec<(Spanned<Pattern>, Spanned<Self>)>,
+    ) -> Self {
         Self::Match {
             matched: Box::new(matched),
             branches,
@@ -419,9 +564,9 @@ impl Expr {
 fn let_binding_maker<B, E>(
     bind: B,
     expr: E,
-) -> impl SubParser<(LetBind, Expr)> + Clone
+) -> impl SubParser<(Spanned<LetBind>, Spanned<Expr>)> + Clone
 where
-    B: SubParser<LetBind> + Clone,
+    B: SubParser<Spanned<LetBind>> + Clone,
     E: ExprParser + Clone,
 {
     just(Token::Let)
@@ -435,11 +580,11 @@ where
 // Results in `pat` and `expr`
 fn let_binding<P: ExprParser + Clone>(
     expr: P,
-) -> impl SubParser<(LetBind, Expr)> + Clone {
+) -> impl SubParser<(Spanned<LetBind>, Spanned<Expr>)> + Clone {
     // used for things like
     // `let x = 5`
     // `let (x, y) = (5, 10);
-    let bound = pattern().map(LetBind::Bound);
+    let bound = pattern().map(LetBind::Bound).map_with_span(spanned);
 
     // used for "function" declaration
     let abstraction = select! { Token::Ident(i) => i}
@@ -453,7 +598,8 @@ fn let_binding<P: ExprParser + Clone>(
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
-        .map(|(name, args)| LetBind::Abstraction(name, args));
+        .map(|(name, args)| LetBind::Abstraction(name, args))
+        .map_with_span(spanned);
 
     #[cfg(debug_assertions)]
     let abstraction = abstraction.boxed();
@@ -483,7 +629,7 @@ where
 
 // Parses tuple expression
 fn tuple<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
-    tuple_like(term, Expr::Tuple)
+    tuple_like(term, Expr::Tuple).map_with_span(spanned)
 }
 
 // Parses list expression
@@ -496,6 +642,7 @@ fn list<P: ExprParser + 'static>(term: P) -> impl ExprParser {
             .delimited_by(just(Token::OpenBracket), just(Token::CloseBracket))
             .collect::<Vec<_>>()
             .map(Expr::List)
+            .map_with_span(spanned)
     })
 }
 
@@ -513,6 +660,7 @@ fn app<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
 // If none negations were found just returns expression
 fn unary<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
     just(Token::Op(Op::Minus))
+        .map_with_span(spanned)
         .repeated()
         .then(term)
         .foldr(Expr::make_unary)
@@ -604,6 +752,7 @@ fn if_expr<P: ExprParser + Clone + 'static>(
             .map(|((cond, then), otherwise)| {
                 Expr::if_with(cond, then, otherwise)
             })
+            .map_with_span(spanned)
     })
 }
 
@@ -613,6 +762,7 @@ fn let_in<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
         .then_ignore(just(Token::In))
         .then(term)
         .map(|((pat, src), target)| Expr::letin_with(pat, src, target))
+        .map_with_span(spanned)
 }
 
 fn match_expr<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
@@ -628,6 +778,7 @@ fn match_expr<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
                 .collect::<Vec<_>>(),
         )
         .map(|(matched, branches)| Expr::match_with(matched, branches))
+        .map_with_span(spanned)
 }
 
 #[allow(clippy::let_and_return)]
@@ -639,6 +790,7 @@ fn expression() -> impl ExprParser + Clone {
             Token::Ident(i) => Expr::Ident(i),
             Token::Str(s) => Expr::Str(s),
         };
+        let literal = literal.map_with_span(spanned);
 
         // literal | grouping | tuple
         let atom =
@@ -697,8 +849,12 @@ fn expression() -> impl ExprParser + Clone {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Statement {
-    Let { bind: LetBind, expr: Expr },
-    ModuleStruct(String, Vec<Self>),
+    Let {
+        bind: Spanned<LetBind>,
+        expr: Spanned<Expr>,
+    },
+    ModuleStruct(String, Vec<Spanned<Self>>),
+    Commented(Spanned<String>, Box<Spanned<Self>>),
 }
 
 impl Statement {
@@ -722,29 +878,54 @@ impl Statement {
     fn module_struct(name: &str, defs: Vec<Self>) -> Self {
         Self::ModuleStruct(name.to_owned(), defs)
     }
+
+    fn with_doc(docstring: Spanned<String>, stmt: Spanned<Self>) -> Self {
+        Self::Commented(docstring, Box::new(stmt))
+    }
 }
 
-fn statement() -> impl SubParser<Statement> {
+fn let_stmt() -> impl SubParser<Spanned<Statement>> {
+    let_binding(expression())
+        .then_ignore(just(Token::SemiColon))
+        .map(|(bind, expr)| Statement::Let { bind, expr })
+        .map_with_span(spanned)
+}
+
+fn module<S: SubParser<Spanned<Statement>>>(
+    stmt: S,
+) -> impl SubParser<Spanned<Statement>> {
+    just(Token::Module)
+        .ignore_then(select! {Token::Ident(i) => i})
+        .then_ignore(just(Token::Is))
+        .then_ignore(just(Token::Struct))
+        .then(stmt.repeated())
+        .then_ignore(just(Token::End))
+        .map(|(name, defs)| Statement::ModuleStruct(name, defs))
+        .map_with_span(spanned)
+}
+
+fn commented<S: SubParser<Spanned<Statement>>>(
+    stmt: S,
+) -> impl SubParser<Spanned<Statement>> {
+    select! {Token::Doc(doc) => doc}
+        .map_with_span(spanned)
+        .then(stmt)
+        .map(|(doc, stmt)| Statement::with_doc(doc, stmt))
+        .map_with_span(spanned)
+}
+
+fn statement() -> impl SubParser<Spanned<Statement>> {
     recursive(|stmt| {
-        let let_stmt = let_binding(expression())
-            .then_ignore(just(Token::SemiColon))
-            .map(|(bind, expr)| Statement::Let { bind, expr });
+        let let_stmt = let_stmt();
+        let module = module(stmt.clone());
+        let commented = commented(stmt);
 
-        let module = just(Token::Module)
-            .ignore_then(select! {Token::Ident(i) => i})
-            .then_ignore(just(Token::Is))
-            .then_ignore(just(Token::Struct))
-            .then(stmt.repeated())
-            .then_ignore(just(Token::End))
-            .map(|(name, defs)| Statement::ModuleStruct(name, defs));
-
-        let_stmt.or(module)
+        commented.or(let_stmt).or(module)
     })
 }
 
-fn ast_parser() -> impl SubParser<Vec<(Statement, Span)>> {
+fn ast_parser() -> impl SubParser<Vec<Spanned<Statement>>> {
     statement()
-        .map_with_span(|stmt, span| (stmt, span))
         .repeated()
         .collect::<Vec<_>>()
         .then_ignore(end())
@@ -752,7 +933,7 @@ fn ast_parser() -> impl SubParser<Vec<(Statement, Span)>> {
 
 #[derive(Debug)]
 pub struct Ast {
-    pub defs: Vec<(Statement, Span)>,
+    pub defs: Vec<Spanned<Statement>>,
 }
 
 impl Ast {
@@ -1930,7 +2111,7 @@ match element
      * Statements  *
      * * * * * * * */
     #[test]
-    fn tokenize_let_stmnt() {
+    fn tokenize_let_stmt() {
         let src = "let x = 50;";
         assert_eq!(
             remove_spans(lexer().parse(src)),
@@ -1998,7 +2179,7 @@ let _ = rm "tmp.kf";
     }
 
     #[test]
-    fn tokenize_enum_stmnt() {
+    fn tokenize_enum_stmt() {
         let src = "type 'a option = Some of 'a | None;";
         assert_eq!(
             remove_spans(lexer().parse(src)),
@@ -2018,7 +2199,7 @@ let _ = rm "tmp.kf";
     }
 
     #[test]
-    fn tokenize_enum_tuple_stmnt() {
+    fn tokenize_enum_tuple_stmt() {
         let src = "type 'a list = Nil | Cons of 'a * 'a list;";
         assert_eq!(
             remove_spans(lexer().parse(src)),
@@ -2041,7 +2222,7 @@ let _ = rm "tmp.kf";
     }
 
     #[test]
-    fn tokenize_tuple_stmnt() {
+    fn tokenize_tuple_stmt() {
         let src = "type point = int * int;";
         assert_eq!(
             remove_spans(lexer().parse(src)),
@@ -2058,7 +2239,7 @@ let _ = rm "tmp.kf";
     }
 
     #[test]
-    fn tokenize_record_stmnt() {
+    fn tokenize_record_stmt() {
         let src = "type date = {year of int, month of int, day of int}";
         assert_eq!(
             remove_spans(lexer().parse(src)),
@@ -2084,7 +2265,7 @@ let _ = rm "tmp.kf";
     }
 
     #[test]
-    fn tokenize_module_stmnt() {
+    fn tokenize_module_stmt() {
         let src = r#"
 module Option = struct
     type 'a option = Some of 'a | None;
@@ -2171,6 +2352,54 @@ end
                         )
                     ),
                 ]
+            ))
+        );
+    }
+
+    #[test]
+    fn tokenize_commented_stmt() {
+        let src = r#"
+// (+) operator wrapper
+let add x y = x + y;
+        "#;
+
+        assert_eq!(
+            remove_spans(lexer().parse(src)),
+            Ok(vec![
+                Token::Doc("(+) operator wrapper".to_owned()),
+                Token::Let,
+                Token::Ident("add".to_owned()),
+                Token::Ident("x".to_owned()),
+                Token::Ident("y".to_owned()),
+                Token::Is,
+                Token::Ident("x".to_owned()),
+                Token::Op(Op::Plus),
+                Token::Ident("y".to_owned()),
+                Token::SemiColon,
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_commented_stmt() {
+        let src = r#"
+// (+) operator wrapper
+let add x y = x + y;
+        "#;
+
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::with_doc(
+                "(+) operator wrapper".to_owned(),
+                Statement::let_abstraction(
+                    "add",
+                    vec![Pattern::ident("x"), Pattern::ident("y")],
+                    Expr::binop_with(
+                        BinOp::Sum,
+                        Expr::ident("x"),
+                        Expr::ident("y"),
+                    )
+                ),
             ))
         );
     }

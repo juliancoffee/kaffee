@@ -1,2 +1,9 @@
-let add x y = x + y;
-let sub x y = x - y;
+module Ord = struct
+    let less x y = x < y;
+    let greater x y = x > y;
+end
+
+module Num = struct
+    let add x y = x + y;
+    let sub x y = x - y;
+end
