@@ -643,8 +643,7 @@ fn let_binding<P: ExprParser + Clone>(
     #[cfg(debug_assertions)]
     let abstraction = abstraction.boxed();
 
-    let_binding_maker(abstraction, expr.clone())
-        .or(let_binding_maker(bound, expr))
+    let_binding_maker(abstraction.or(bound), expr)
 }
 
 // Parses tuple expression
@@ -862,6 +861,7 @@ fn expression() -> impl ExprParser + Clone {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Type {
     Ident(String),
+    Var(String),
     Product(Vec<Spanned<Self>>),
 }
 
@@ -870,25 +870,43 @@ impl Type {
     fn ident(name: &str) -> Self {
         Self::Ident(name.to_owned())
     }
+
+    #[cfg(test)]
+    fn var(name: &str) -> Self {
+        Self::Var(name.to_owned())
+    }
 }
 
-fn ty() -> impl SubParser<Spanned<Type>> {
-    let ident =
-        select! {Token::Ident(i) => Type::Ident(i)}.map_with_span(spanned);
-
-    let product = ident
-        .separated_by(just(Token::Op(Op::Product)))
+fn product_type<P: SubParser<Spanned<Type>>>(
+    item: P,
+) -> impl SubParser<Spanned<Type>> {
+    item.separated_by(just(Token::Op(Op::Product)))
         .at_least(2)
         .collect::<Vec<_>>()
         .map(Type::Product)
-        .map_with_span(spanned);
+        .map_with_span(spanned)
+}
+
+fn ty() -> impl SubParser<Spanned<Type>> {
+    let type_var = select! {
+        Token::TypeParameter(p) => Type::Var(p),
+    };
+    let type_var = type_var.map_with_span(spanned);
+
+    let ident = select! {
+        Token::Ident(i) => Type::Ident(i),
+    };
+    let ident = ident.map_with_span(spanned);
+
+    let product = product_type(ident.or(type_var));
 
     product.or(ident)
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum TypeBind {
-    Bound(String),
+    Bound(Spanned<String>),
+    Abstraction(Spanned<String>, Vec<Spanned<String>>),
 }
 
 impl TypeBind {
@@ -896,15 +914,34 @@ impl TypeBind {
     fn bound(name: &str) -> Self {
         Self::Bound(name.to_owned())
     }
+
+    #[cfg(test)]
+    fn abstraction(name: &str, vars: Vec<&str>) -> Self {
+        Self::Abstraction(
+            name.to_owned(),
+            vars.into_iter().map(str::to_owned).collect(),
+        )
+    }
 }
 
-fn type_bind() -> impl SubParser<Spanned<TypeBind>> {
-    select! {Token::Ident(i) => TypeBind::Bound(i)}.map_with_span(spanned)
+fn type_bind() -> impl SubParser<TypeBind> {
+    let bound = select! {Token::Ident(i) => i}
+        .map_with_span(spanned)
+        .map(TypeBind::Bound);
+
+    let abstraction = tuple_like(
+        select! {Token::TypeParameter(p) => p}.map_with_span(spanned),
+        std::convert::identity,
+    )
+    .then(select! {Token::Ident(name) => name}.map_with_span(spanned))
+    .map(|(vars, name)| TypeBind::Abstraction(name, vars));
+
+    bound.or(abstraction)
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum TypeDef {
-    Alias(Spanned<TypeBind>, Spanned<Type>),
+    Alias(TypeBind, Spanned<Type>),
 }
 
 #[allow(clippy::let_and_return)]
@@ -2314,6 +2351,18 @@ let _ = rm "tmp.kf";
                 Token::TypeParameter("b".to_owned()),
                 Token::Semicolon,
             ])
+        );
+    }
+
+    #[test]
+    fn parse_type_alias_generic_tuple_stmt() {
+        let src = "type ('a, 'b) pair = 'a * 'b;";
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::TypeDef(TypeDef::Alias(
+                TypeBind::abstraction("pair", vec!["a", "b"]),
+                Type::Product(vec![Type::var("a"), Type::var("b")]),
+            )))
         );
     }
 

@@ -1,9 +1,21 @@
+// Module for integer comparison operations
 module Ord = struct
     let less x y = x < y;
     let greater x y = x > y;
 end
 
+// Module for integer arithmetic operations
 module Num = struct
+    // (+) operator wrapper
     let add x y = x + y;
+    // (-) operator wrapper
     let sub x y = x - y;
+end
+
+module Collections = struct
+    // Generic pair
+    type ('a, 'b) pair = 'a * 'b;
+
+    // Type alias for array index
+    type idx = nat;
 end
