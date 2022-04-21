@@ -147,7 +147,7 @@ enum Token {
     Is,
     In,
     // Finishers
-    SemiColon,
+    Semicolon,
     End,
     // Groupers
     OpenParen,
@@ -229,7 +229,7 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         just("=>").to(Token::MatchArrow),
         just('_').to(Token::Wildcard),
         just('=').to(Token::Is),
-        just(';').to(Token::SemiColon),
+        just(';').to(Token::Semicolon),
         just(',').to(Token::Comma),
         just('|').to(Token::Either),
         just('(').to(Token::OpenParen),
@@ -247,6 +247,49 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         .padded()
         .repeated()
         .then_ignore(end())
+}
+
+/* * * * * * * * * * * * * *
+ * Useful generic parsers  *
+ * * * * * * * * * * * * * */
+
+// Parses enclosed item
+//
+// Result in whatever item were inside parens, so basically works by removing
+// parens.
+fn grouping<I, P: SubParser<I> + Clone>(expr: P) -> impl SubParser<I> + Clone {
+    expr.delimited_by(just(Token::OpenParen), just(Token::CloseParen))
+}
+
+// Parses comma separated items delimited by parens
+fn tuple_like<S, O, F, P>(item: P, f: F) -> impl SubParser<O> + Clone
+where
+    F: Fn(Vec<S>) -> O + Clone,
+    P: SubParser<S> + Clone,
+{
+    item.separated_by(just(Token::Comma))
+        .delimited_by(just(Token::OpenParen), just(Token::CloseParen))
+        .collect::<Vec<_>>()
+        .map(f)
+}
+
+// Parses `a op b op .. op z` chains
+//
+// If none of `op` were found, just return first parsed item.
+//
+// `op` may be multiple operators, but remember that each precedence step
+// should be separate.
+fn foldl_binops<T, OP, TP, F>(
+    item: TP,
+    op: OP,
+    f: F,
+) -> impl SubParser<T> + Clone
+where
+    TP: SubParser<T> + Clone,
+    OP: SubParser<Token> + Clone,
+    F: Fn(T, (Token, T)) -> T + Clone,
+{
+    item.clone().then(op.then(item).repeated()).foldl(f)
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -392,7 +435,7 @@ fn pattern() -> impl SubParser<Spanned<Pattern>> + Clone {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub enum LetBind {
+pub enum Bind {
     Abstraction(String, Vec<Spanned<Pattern>>),
     Bound(Spanned<Pattern>),
 }
@@ -420,7 +463,7 @@ pub enum Expr {
     },
     // let <bind> = <src> in <target>
     LetIn {
-        bind: Spanned<LetBind>,
+        bind: Spanned<Bind>,
         src: Box<Spanned<Self>>,
         target: Box<Spanned<Self>>,
     },
@@ -519,7 +562,7 @@ impl Expr {
     }
 
     fn letin_with(
-        bind: Spanned<LetBind>,
+        bind: Spanned<Bind>,
         src: Spanned<Self>,
         target: Spanned<Self>,
     ) -> Self {
@@ -532,7 +575,7 @@ impl Expr {
 
     #[cfg(test)]
     fn let_bound_in(pat: Pattern, src: Self, target: Self) -> Self {
-        Self::letin_with(LetBind::Bound(pat), src, target)
+        Self::letin_with(Bind::Bound(pat), src, target)
     }
 
     #[cfg(test)]
@@ -542,11 +585,7 @@ impl Expr {
         src: Self,
         target: Self,
     ) -> Self {
-        Self::letin_with(
-            LetBind::Abstraction(name.to_owned(), args),
-            src,
-            target,
-        )
+        Self::letin_with(Bind::Abstraction(name.to_owned(), args), src, target)
     }
 
     fn match_with(
@@ -564,9 +603,9 @@ impl Expr {
 fn let_binding_maker<B, E>(
     bind: B,
     expr: E,
-) -> impl SubParser<(Spanned<LetBind>, Spanned<Expr>)> + Clone
+) -> impl SubParser<(Spanned<Bind>, Spanned<Expr>)> + Clone
 where
-    B: SubParser<Spanned<LetBind>> + Clone,
+    B: SubParser<Spanned<Bind>> + Clone,
     E: ExprParser + Clone,
 {
     just(Token::Let)
@@ -580,11 +619,11 @@ where
 // Results in `pat` and `expr`
 fn let_binding<P: ExprParser + Clone>(
     expr: P,
-) -> impl SubParser<(Spanned<LetBind>, Spanned<Expr>)> + Clone {
+) -> impl SubParser<(Spanned<Bind>, Spanned<Expr>)> + Clone {
     // used for things like
     // `let x = 5`
     // `let (x, y) = (5, 10);
-    let bound = pattern().map(LetBind::Bound).map_with_span(spanned);
+    let bound = pattern().map(Bind::Bound).map_with_span(spanned);
 
     // used for "function" declaration
     let abstraction = select! { Token::Ident(i) => i}
@@ -598,7 +637,7 @@ fn let_binding<P: ExprParser + Clone>(
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
-        .map(|(name, args)| LetBind::Abstraction(name, args))
+        .map(|(name, args)| Bind::Abstraction(name, args))
         .map_with_span(spanned);
 
     #[cfg(debug_assertions)]
@@ -606,25 +645,6 @@ fn let_binding<P: ExprParser + Clone>(
 
     let_binding_maker(abstraction, expr.clone())
         .or(let_binding_maker(bound, expr))
-}
-
-// Parses grouped expression
-//
-// Result in whatever Expr were inside parens
-fn grouping<I, P: SubParser<I> + Clone>(expr: P) -> impl SubParser<I> + Clone {
-    expr.delimited_by(just(Token::OpenParen), just(Token::CloseParen))
-}
-
-// Parses comma separated items delimited by parens
-fn tuple_like<S, O, F, P>(item: P, f: F) -> impl SubParser<O> + Clone
-where
-    F: Fn(Vec<S>) -> O + Clone,
-    P: SubParser<S> + Clone,
-{
-    item.separated_by(just(Token::Comma))
-        .delimited_by(just(Token::OpenParen), just(Token::CloseParen))
-        .collect::<Vec<_>>()
-        .map(f)
 }
 
 // Parses tuple expression
@@ -649,8 +669,6 @@ fn list<P: ExprParser + 'static>(term: P) -> impl ExprParser {
 // Parses application `e e e`
 //
 // Returns expression 'as is' if none of applications were found
-//
-// TODO: remake to be used with patterns?
 fn app<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
     term.clone().then(term.repeated()).foldl(Expr::app)
 }
@@ -671,14 +689,11 @@ fn unary<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
 //
 // If none operators were found just returns expression
 fn product<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
-    term.clone()
-        .then(
-            just(Token::Op(Op::Product))
-                .or(just(Token::Op(Op::Divide)))
-                .then(term)
-                .repeated(),
-        )
-        .foldl(|x, (op, y)| Expr::make_binop(op, x, y))
+    foldl_binops(
+        term,
+        just(Token::Op(Op::Product)).or(just(Token::Op(Op::Divide))),
+        |x, (op, y)| Expr::make_binop(op, x, y),
+    )
 }
 
 // Parses arithmetic expression `x + y` | `x - y`
@@ -686,14 +701,11 @@ fn product<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
 //
 // If none operators were found just returns expression
 fn arithmetic<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
-    term.clone()
-        .then(
-            just(Token::Op(Op::Plus))
-                .or(just(Token::Op(Op::Minus)))
-                .then(term)
-                .repeated(),
-        )
-        .foldl(|x, (op, y)| Expr::make_binop(op, x, y))
+    foldl_binops(
+        term,
+        just(Token::Op(Op::Plus)).or(just(Token::Op(Op::Minus))),
+        |x, (op, y)| Expr::make_binop(op, x, y),
+    )
 }
 
 // Parses order comparisons `x < y` | `x > y`
@@ -722,18 +734,18 @@ fn equality<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
 //
 // If none of `&&` were found just returns expression
 fn and<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
-    term.clone()
-        .then(just(Token::Op(Op::And)).then(term).repeated())
-        .foldl(|a, (op, b)| Expr::make_binop(op, a, b))
+    foldl_binops(term, just(Token::Op(Op::And)), |a, (op, b)| {
+        Expr::make_binop(op, a, b)
+    })
 }
 
 // Parses logic or `a || b` (for any amount of ||)
 //
 // If none of `||` were found just returns expression
 fn or<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
-    term.clone()
-        .then(just(Token::Op(Op::Or)).then(term).repeated())
-        .foldl(|a, (op, b)| Expr::make_binop(op, a, b))
+    foldl_binops(term, just(Token::Op(Op::Or)), |a, (op, b)| {
+        Expr::make_binop(op, a, b)
+    })
 }
 
 // Parses if <cond> then <yes> else <no>
@@ -848,11 +860,72 @@ fn expression() -> impl ExprParser + Clone {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum Type {
+    Ident(String),
+    Product(Vec<Spanned<Self>>),
+}
+
+impl Type {
+    #[cfg(test)]
+    fn ident(name: &str) -> Self {
+        Self::Ident(name.to_owned())
+    }
+}
+
+fn ty() -> impl SubParser<Spanned<Type>> {
+    let ident =
+        select! {Token::Ident(i) => Type::Ident(i)}.map_with_span(spanned);
+
+    let product = ident
+        .separated_by(just(Token::Op(Op::Product)))
+        .at_least(2)
+        .collect::<Vec<_>>()
+        .map(Type::Product)
+        .map_with_span(spanned);
+
+    product.or(ident)
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum TypeBind {
+    Bound(String),
+}
+
+impl TypeBind {
+    #[cfg(test)]
+    fn bound(name: &str) -> Self {
+        Self::Bound(name.to_owned())
+    }
+}
+
+fn type_bind() -> impl SubParser<Spanned<TypeBind>> {
+    select! {Token::Ident(i) => TypeBind::Bound(i)}.map_with_span(spanned)
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum TypeDef {
+    Alias(Spanned<TypeBind>, Spanned<Type>),
+}
+
+#[allow(clippy::let_and_return)]
+fn typedef() -> impl SubParser<TypeDef> {
+    let alias = just(Token::Type)
+        .ignore_then(type_bind())
+        .then_ignore(just(Token::Is))
+        .then(ty())
+        .then_ignore(just(Token::Semicolon))
+        .map(|(bind, ty)| TypeDef::Alias(bind, ty));
+
+    alias
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum Statement {
     Let {
-        bind: Spanned<LetBind>,
+        bind: Spanned<Bind>,
         expr: Spanned<Expr>,
     },
+    TypeDef(TypeDef),
     ModuleStruct(String, Vec<Spanned<Self>>),
     Commented(Spanned<String>, Box<Spanned<Self>>),
 }
@@ -861,7 +934,7 @@ impl Statement {
     #[cfg(test)]
     fn let_bound(pat: Pattern, expr: Expr) -> Self {
         Self::Let {
-            bind: LetBind::Bound(pat),
+            bind: Bind::Bound(pat),
             expr,
         }
     }
@@ -869,7 +942,7 @@ impl Statement {
     #[cfg(test)]
     fn let_abstraction(name: &str, args: Vec<Pattern>, expr: Expr) -> Self {
         Self::Let {
-            bind: LetBind::Abstraction(name.to_owned(), args),
+            bind: Bind::Abstraction(name.to_owned(), args),
             expr,
         }
     }
@@ -886,7 +959,7 @@ impl Statement {
 
 fn let_stmt() -> impl SubParser<Spanned<Statement>> {
     let_binding(expression())
-        .then_ignore(just(Token::SemiColon))
+        .then_ignore(just(Token::Semicolon))
         .map(|(bind, expr)| Statement::Let { bind, expr })
         .map_with_span(spanned)
 }
@@ -919,8 +992,9 @@ fn statement() -> impl SubParser<Spanned<Statement>> {
         let let_stmt = let_stmt();
         let module = module(stmt.clone());
         let commented = commented(stmt);
+        let typedef = typedef().map(Statement::TypeDef).map_with_span(spanned);
 
-        commented.or(let_stmt).or(module)
+        choice((commented, let_stmt, module, typedef))
     })
 }
 
@@ -2120,7 +2194,7 @@ match element
                 Token::Ident("x".to_owned()),
                 Token::Is,
                 Token::Int("50".to_owned()),
-                Token::SemiColon,
+                Token::Semicolon,
             ])
         );
     }
@@ -2179,7 +2253,72 @@ let _ = rm "tmp.kf";
     }
 
     #[test]
-    fn tokenize_enum_stmt() {
+    fn tokenize_type_alias_tuple_stmt() {
+        let src = "type point = int * int;";
+        assert_eq!(
+            remove_spans(lexer().parse(src)),
+            Ok(vec![
+                Token::Type,
+                Token::Ident("point".to_owned()),
+                Token::Is,
+                Token::Ident("int".to_owned()),
+                Token::Op(Op::Product),
+                Token::Ident("int".to_owned()),
+                Token::Semicolon,
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_type_alias_stmt() {
+        let src = "type idx = nat;";
+
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::TypeDef(TypeDef::Alias(
+                TypeBind::bound("idx"),
+                Type::ident("nat"),
+            )))
+        );
+    }
+
+    #[test]
+    fn parse_type_alias_tuple_stmt() {
+        let src = "type point = int * int;";
+
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::TypeDef(TypeDef::Alias(
+                TypeBind::bound("point"),
+                Type::Product(vec![Type::ident("int"), Type::ident("int")]),
+            )))
+        );
+    }
+
+    #[test]
+    fn tokenize_type_alias_generic_tuple_stmt() {
+        let src = "type ('a, 'b) pair = 'a * 'b;";
+        assert_eq!(
+            remove_spans(lexer().parse(src)),
+            Ok(vec![
+                Token::Type,
+                Token::OpenParen,
+                Token::TypeParameter("a".to_owned()),
+                Token::Comma,
+                Token::TypeParameter("b".to_owned()),
+                Token::CloseParen,
+                Token::Ident("pair".to_owned()),
+                Token::Is,
+                Token::TypeParameter("a".to_owned()),
+                Token::Op(Op::Product),
+                Token::TypeParameter("b".to_owned()),
+                Token::Semicolon,
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_type_enum_stmt() {
         let src = "type 'a option = Some of 'a | None;";
         assert_eq!(
             remove_spans(lexer().parse(src)),
@@ -2193,13 +2332,13 @@ let _ = rm "tmp.kf";
                 Token::TypeParameter("a".to_owned()),
                 Token::Either,
                 Token::Ident("None".to_owned()),
-                Token::SemiColon,
+                Token::Semicolon,
             ])
         );
     }
 
     #[test]
-    fn tokenize_enum_tuple_stmt() {
+    fn tokenize_type_enum_tuple_stmt() {
         let src = "type 'a list = Nil | Cons of 'a * 'a list;";
         assert_eq!(
             remove_spans(lexer().parse(src)),
@@ -2216,30 +2355,13 @@ let _ = rm "tmp.kf";
                 Token::Op(Op::Product),
                 Token::TypeParameter("a".to_owned()),
                 Token::Ident("list".to_owned()),
-                Token::SemiColon,
+                Token::Semicolon,
             ])
         );
     }
 
     #[test]
-    fn tokenize_tuple_stmt() {
-        let src = "type point = int * int;";
-        assert_eq!(
-            remove_spans(lexer().parse(src)),
-            Ok(vec![
-                Token::Type,
-                Token::Ident("point".to_owned()),
-                Token::Is,
-                Token::Ident("int".to_owned()),
-                Token::Op(Op::Product),
-                Token::Ident("int".to_owned()),
-                Token::SemiColon,
-            ])
-        );
-    }
-
-    #[test]
-    fn tokenize_record_stmt() {
+    fn tokenize_type_record_stmt() {
         let src = "type date = {year of int, month of int, day of int}";
         assert_eq!(
             remove_spans(lexer().parse(src)),
@@ -2292,7 +2414,7 @@ end
                 Token::TypeParameter("a".to_owned()),
                 Token::Either,
                 Token::Ident("None".to_owned()),
-                Token::SemiColon,
+                Token::Semicolon,
                 // function declaration
                 Token::Let,
                 Token::Ident("map".to_owned()),
@@ -2312,7 +2434,7 @@ end
                 Token::Ident("None".to_owned()),
                 Token::MatchArrow,
                 Token::Ident("None".to_owned()),
-                Token::SemiColon,
+                Token::Semicolon,
                 // end of module declaration
                 Token::End,
             ])
@@ -2375,7 +2497,7 @@ let add x y = x + y;
                 Token::Ident("x".to_owned()),
                 Token::Op(Op::Plus),
                 Token::Ident("y".to_owned()),
-                Token::SemiColon,
+                Token::Semicolon,
             ])
         );
     }
