@@ -1,3 +1,22 @@
+/* TODO:
+# Parser
+- Types
+  - Type Application
+  - Function type
+  - Variant type definition
+  - Record type definition
+- Modules
+  - module X = sig .. end
+  - include X;
+  - open X;
+  - open X in
+- Functional operators
+  - |> pipe operator
+- Meta programming
+  - Attributes
+  - Directives
+  - Literal Spells (operator and literal overloading)
+*/
 #![warn(clippy::pedantic)]
 use chumsky::{prelude::*, Stream};
 
@@ -146,6 +165,7 @@ enum Token {
     Of,
     Is,
     In,
+    Dot,
     // Finishers
     Semicolon,
     End,
@@ -229,6 +249,7 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         just("=>").to(Token::MatchArrow),
         just('_').to(Token::Wildcard),
         just('=').to(Token::Is),
+        just('.').to(Token::Dot),
         just(';').to(Token::Semicolon),
         just(',').to(Token::Comma),
         just('|').to(Token::Either),
@@ -453,6 +474,7 @@ pub enum Expr {
     Unary(UnOp, Box<Spanned<Self>>),
     BinOp(BinOp, Box<Spanned<Self>>, Box<Spanned<Self>>),
     App(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    FromModule(Spanned<String>, Box<Spanned<Self>>),
     // Compound
     // if <cond> then <yes> else <no>
     If {
@@ -485,6 +507,10 @@ impl Expr {
     #[cfg(test)]
     fn string(s: &str) -> Self {
         Self::Str(s.to_owned())
+    }
+
+    fn from_module(mod_name: Spanned<String>, x: Spanned<Self>) -> Self {
+        Self::FromModule(mod_name, Box::new(x))
     }
 
     fn app(f: Spanned<Self>, x: Spanned<Self>) -> Spanned<Self> {
@@ -651,6 +677,16 @@ fn tuple<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
     tuple_like(term, Expr::Tuple).map_with_span(spanned)
 }
 
+// Parses module subscription
+fn from_module<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
+    select! {Token::Ident(m) => m}
+        .map_with_span(spanned)
+        .then_ignore(just(Token::Dot))
+        .then(term)
+        .map(|(mod_name, expr)| Expr::from_module(mod_name, expr))
+        .map_with_span(spanned)
+}
+
 // Parses list expression
 fn list<P: ExprParser + 'static>(term: P) -> impl ExprParser {
     recursive(|sublist| {
@@ -813,14 +849,16 @@ fn expression() -> impl ExprParser + Clone {
         let term = atom.or(list);
         #[cfg(debug_assertions)]
         let term = term.boxed();
+        // module subscription (Mod.e)
+        let from_module = from_module(term.clone());
         // application (e e e)
-        let app = app(term.clone());
+        let app = app(from_module.or(term));
         // unary negation
-        let unary = unary(app.clone());
+        let unary = unary(app);
         // product (*, /)
-        let product = product(unary.clone());
+        let product = product(unary);
         // arithmetic (+, -)
-        let arithmetic = arithmetic(product.clone());
+        let arithmetic = arithmetic(product);
         #[cfg(debug_assertions)]
         let arithmetic = arithmetic.boxed();
         // order (<, >)
@@ -832,10 +870,10 @@ fn expression() -> impl ExprParser + Clone {
         #[cfg(debug_assertions)]
         let element = element.boxed();
         // and (&&)
-        let and = and(element.clone());
+        let and = and(element);
         // or
-        let or = or(and.clone());
-        let complex = or.clone();
+        let or = or(and);
+        let complex = or;
         #[cfg(debug_assertions)]
         let complex = complex.boxed();
         // if <cond> then <yes> else <no>
@@ -1358,6 +1396,69 @@ mod tests {
                 ])
             ))
         );
+    }
+
+    #[test]
+    fn tokenize_from_module_expr() {
+        let src = "Nat.succ 5";
+
+        assert_eq!(
+            remove_spans(lexer().parse(src)),
+            Ok(vec![
+                Token::Ident("Nat".to_owned()),
+                Token::Dot,
+                Token::Ident("succ".to_owned()),
+                Token::Int("5".to_owned()),
+            ])
+        )
+    }
+
+    #[test]
+    fn parse_from_module_ident_expr() {
+        let src = "Nat.succ 5";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::app(
+                Expr::from_module("Nat".to_owned(), Expr::ident("succ")),
+                Expr::Int(5)
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_from_module_complex_expr() {
+        let src = "List.(map double xs)";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::from_module(
+                "List".to_owned(),
+                Expr::app(
+                    Expr::app(Expr::ident("map"), Expr::ident("double")),
+                    Expr::ident("xs"),
+                )
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_from_module_complex_nested_expr() {
+        let src = "List.(map Int.double xs)";
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::from_module(
+                "List",
+                Expr::app(
+                    Expr::app(
+                        Expr::ident("map"),
+                        Expr::from_module(
+                            "Int".to_owned(),
+                            Expr::ident("double")
+                        )
+                    ),
+                    Expr::ident("xs"),
+                )
+            ))
+        )
     }
 
     #[test]
