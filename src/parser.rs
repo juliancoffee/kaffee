@@ -1,21 +1,22 @@
 /* TODO:
 # Parser
 - Types
-  - Type Application
-  - Function type
-  - Variant type definition
-  - Record type definition
+    - Type from module
+    - Type Application
+    - Function type
+    - Variant type definition
+    - Record type definition
 - Modules
-  - module X = sig .. end
-  - include X;
-  - open X;
-  - open X in
+    - module X = sig .. end
+    - include X;
+    - open X;
+    - open X in
 - Functional operators
-  - |> pipe operator
+    - |> pipe operator
 - Meta programming
-  - Attributes
-  - Directives
-  - Literal Spells (operator and literal overloading)
+    - Attributes
+    - Directives
+    - Spelling of collection literals
 */
 #![warn(clippy::pedantic)]
 use chumsky::{prelude::*, Stream};
@@ -146,6 +147,7 @@ enum Token {
     Int(String),
     Str(String),
     Ident(String),
+    LiteralSpell(String),
     TypeParameter(String),
     // Operators
     Op(Op),
@@ -199,8 +201,8 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let doc = row_comment
         .repeated()
         .at_least(1)
-        .collect::<String>()
-        .map(Token::Doc);
+        .collect::<Vec<_>>()
+        .map(|comments| Token::Doc(comments.join("\n")));
 
     let int = text::int(10).map(Token::Int);
     let string = just('"')
@@ -211,12 +213,11 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
 
     let atom = int.or(string);
 
-    let alphabetic = filter(char::is_ascii_alphabetic)
-        .repeated()
-        .at_least(1)
+    let ident_like = filter(char::is_ascii_alphabetic)
+        .chain(filter(char::is_ascii_alphanumeric).repeated())
         .collect::<String>();
 
-    let word = alphabetic.map(|word| match word.as_str() {
+    let ident = ident_like.map(|word| match word.as_str() {
         "let" => Token::Let,
         "type" => Token::Type,
         "of" => Token::Of,
@@ -230,9 +231,13 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         "end" => Token::End,
         word => Token::Ident(word.to_owned()),
     });
-    let marked = just('\'').ignore_then(alphabetic).map(Token::TypeParameter);
+    let typevar = just('\'').ignore_then(ident_like).map(Token::TypeParameter);
+    let spell = just("@").ignore_then(ident_like).map(Token::LiteralSpell);
 
-    let op = choice((
+    let word = choice((ident, typevar, spell));
+
+    let symbol = choice((
+        // operators
         just('<').to(Token::Op(Op::Less)),
         just('>').to(Token::Op(Op::Greater)),
         just("==").to(Token::Op(Op::Equal)),
@@ -243,9 +248,7 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         just('-').to(Token::Op(Op::Minus)),
         just('*').to(Token::Op(Op::Product)),
         just('/').to(Token::Op(Op::Divide)),
-    ));
-
-    let ctrl = choice((
+        // control symbols
         just("=>").to(Token::MatchArrow),
         just('_').to(Token::Wildcard),
         just('=').to(Token::Is),
@@ -261,7 +264,7 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         just('}').to(Token::CloseBrace),
     ));
 
-    let token = choice((doc, atom, op, ctrl, marked, word));
+    let token = choice((doc, atom, symbol, word));
 
     token
         .map_with_span(|tok, span| (tok, span))
@@ -332,6 +335,24 @@ pub enum BinOp {
     NotEqual,
     And,
     Or,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Name {
+    Plain(String),
+    Spell(String),
+}
+
+impl Name {
+    #[cfg(test)]
+    fn plain(name: &str) -> Self {
+        Name::Plain(name.to_owned())
+    }
+
+    #[cfg(test)]
+    fn spell(name: &str) -> Self {
+        Name::Spell(name.to_owned())
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -457,7 +478,7 @@ fn pattern() -> impl SubParser<Spanned<Pattern>> + Clone {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Bind {
-    Abstraction(String, Vec<Spanned<Pattern>>),
+    Abstraction(Name, Vec<Spanned<Pattern>>),
     Bound(Spanned<Pattern>),
 }
 
@@ -606,12 +627,12 @@ impl Expr {
 
     #[cfg(test)]
     fn let_abstraction_in(
-        name: &str,
+        name: Name,
         args: Vec<Pattern>,
         src: Self,
         target: Self,
     ) -> Self {
-        Self::letin_with(Bind::Abstraction(name.to_owned(), args), src, target)
+        Self::letin_with(Bind::Abstraction(name, args), src, target)
     }
 
     fn match_with(
@@ -652,19 +673,20 @@ fn let_binding<P: ExprParser + Clone>(
     let bound = pattern().map(Bind::Bound).map_with_span(spanned);
 
     // used for "function" declaration
-    let abstraction = select! { Token::Ident(i) => i}
-        .then(
-            atomic_pattern(pattern())
-                .or(complex_pattern(pattern()).delimited_by(
-                    just(Token::OpenParen),
-                    just(Token::CloseParen),
-                ))
-                .repeated()
-                .at_least(1)
-                .collect::<Vec<_>>(),
-        )
-        .map(|(name, args)| Bind::Abstraction(name, args))
-        .map_with_span(spanned);
+    let abstraction = select! {
+        Token::Ident(i) => Name::Plain(i),
+        Token::LiteralSpell(s) => Name::Spell(s),
+    }
+    .then(
+        atomic_pattern(pattern())
+            .or(complex_pattern(pattern())
+                .delimited_by(just(Token::OpenParen), just(Token::CloseParen)))
+            .repeated()
+            .at_least(1)
+            .collect::<Vec<_>>(),
+    )
+    .map(|(name, args)| Bind::Abstraction(name, args))
+    .map_with_span(spanned);
 
     #[cfg(debug_assertions)]
     let abstraction = abstraction.boxed();
@@ -943,14 +965,16 @@ fn ty() -> impl SubParser<Spanned<Type>> {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum TypeBind {
-    Bound(Spanned<String>),
+    Bound(Spanned<Name>),
+    // TODO: make abstraction use Name as well to be able to create spells for
+    // list literals.
     Abstraction(Spanned<String>, Vec<Spanned<String>>),
 }
 
 impl TypeBind {
     #[cfg(test)]
-    fn bound(name: &str) -> Self {
-        Self::Bound(name.to_owned())
+    fn bound(name: Name) -> Self {
+        Self::Bound(name)
     }
 
     #[cfg(test)]
@@ -963,9 +987,12 @@ impl TypeBind {
 }
 
 fn type_bind() -> impl SubParser<TypeBind> {
-    let bound = select! {Token::Ident(i) => i}
-        .map_with_span(spanned)
-        .map(TypeBind::Bound);
+    let bound = select! {
+        Token::Ident(i) => Name::Plain(i),
+        Token::LiteralSpell(s) => Name::Spell(s),
+    }
+    .map_with_span(spanned)
+    .map(TypeBind::Bound);
 
     let abstraction = tuple_like(
         select! {Token::TypeParameter(p) => p}.map_with_span(spanned),
@@ -1015,9 +1042,9 @@ impl Statement {
     }
 
     #[cfg(test)]
-    fn let_abstraction(name: &str, args: Vec<Pattern>, expr: Expr) -> Self {
+    fn let_abstraction(name: Name, args: Vec<Pattern>, expr: Expr) -> Self {
         Self::Let {
-            bind: Bind::Abstraction(name.to_owned(), args),
+            bind: Bind::Abstraction(name, args),
             expr,
         }
     }
@@ -1410,7 +1437,7 @@ mod tests {
                 Token::Ident("succ".to_owned()),
                 Token::Int("5".to_owned()),
             ])
-        )
+        );
     }
 
     #[test]
@@ -1422,7 +1449,7 @@ mod tests {
                 Expr::from_module("Nat".to_owned(), Expr::ident("succ")),
                 Expr::Int(5)
             ))
-        )
+        );
     }
 
     #[test]
@@ -1437,7 +1464,7 @@ mod tests {
                     Expr::ident("xs"),
                 )
             ))
-        )
+        );
     }
 
     #[test]
@@ -1446,7 +1473,7 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::from_module(
-                "List",
+                "List".to_owned(),
                 Expr::app(
                     Expr::app(
                         Expr::ident("map"),
@@ -1458,7 +1485,7 @@ mod tests {
                     Expr::ident("xs"),
                 )
             ))
-        )
+        );
     }
 
     #[test]
@@ -1909,6 +1936,32 @@ else 1
     }
 
     #[test]
+    fn tokenize_let_in_with_spell_expr() {
+        let src = r#"
+let @plus x y = Int.plus
+in x + y
+        "#;
+
+        assert_eq!(
+            remove_spans(lexer().parse(src)),
+            Ok(vec![
+                Token::Let,
+                Token::LiteralSpell("plus".to_owned()),
+                Token::Ident("x".to_owned()),
+                Token::Ident("y".to_owned()),
+                Token::Is,
+                Token::Ident("Int".to_owned()),
+                Token::Dot,
+                Token::Ident("plus".to_owned()),
+                Token::In,
+                Token::Ident("x".to_owned()),
+                Token::Op(Op::Plus),
+                Token::Ident("y".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
     fn parse_let_in_expr() {
         let src = "let x = 5 in Some x";
         assert_eq!(
@@ -1976,7 +2029,7 @@ chain next next 5
         assert_eq!(
             parse_expr(src),
             Ok(Expr::let_abstraction_in(
-                "chain",
+                Name::plain("chain"),
                 vec![
                     Pattern::ident("f"),
                     Pattern::ident("g"),
@@ -2007,7 +2060,7 @@ add (5, 10)
         assert_eq!(
             parse_expr(src),
             Ok(Expr::let_abstraction_in(
-                "add",
+                Name::plain("add"),
                 vec![Pattern::Tuple(vec![
                     Pattern::ident("x"),
                     Pattern::ident("y"),
@@ -2096,7 +2149,34 @@ f 5 (Some 6) (One 8) (5, 10) 10 "whatever"
 
         assert_eq!(
             parse_expr(src),
-            Ok(Expr::let_abstraction_in("f", args, expr, target))
+            Ok(Expr::let_abstraction_in(
+                Name::plain("f"),
+                args,
+                expr,
+                target
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_let_in_abstraction_with_spell_expr() {
+        let src = r#"
+let @plus x y = Int.plus
+in x + y
+        "#;
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::let_abstraction_in(
+                Name::spell("plus"),
+                vec![Pattern::ident("x"), Pattern::ident("y"),],
+                Expr::from_module("Int".to_owned(), Expr::ident("plus")),
+                Expr::binop_with(
+                    BinOp::Sum,
+                    Expr::ident("x"),
+                    Expr::ident("y"),
+                )
+            ))
         );
     }
 
@@ -2383,7 +2463,7 @@ let _ = rm "tmp.kf";
         assert_eq!(
             parse_stmt(src),
             Ok(Statement::let_abstraction(
-                "neg",
+                Name::plain("neg"),
                 vec![Pattern::ident("x")],
                 Expr::unary_with(UnOp::Negative, Expr::ident("x"))
             ))
@@ -2414,7 +2494,7 @@ let _ = rm "tmp.kf";
         assert_eq!(
             parse_stmt(src),
             Ok(Statement::TypeDef(TypeDef::Alias(
-                TypeBind::bound("idx"),
+                TypeBind::bound(Name::plain("idx")),
                 Type::ident("nat"),
             )))
         );
@@ -2427,8 +2507,37 @@ let _ = rm "tmp.kf";
         assert_eq!(
             parse_stmt(src),
             Ok(Statement::TypeDef(TypeDef::Alias(
-                TypeBind::bound("point"),
+                TypeBind::bound(Name::plain("point")),
                 Type::Product(vec![Type::ident("int"), Type::ident("int")]),
+            )))
+        );
+    }
+
+    #[test]
+    fn tokenize_type_alias_with_spell_stmt() {
+        let src = "type @integer = int64;";
+
+        assert_eq!(
+            remove_spans(lexer().parse(src)),
+            Ok(vec![
+                Token::Type,
+                Token::LiteralSpell("integer".to_owned()),
+                Token::Is,
+                Token::Ident("int64".to_owned()),
+                Token::Semicolon,
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_type_alias_with_spell_stmt() {
+        let src = "type @integer = int64;";
+
+        assert_eq!(
+            parse_stmt(src),
+            Ok(Statement::TypeDef(TypeDef::Alias(
+                TypeBind::bound(Name::spell("integer")),
+                Type::ident("int64"),
             )))
         );
     }
@@ -2606,7 +2715,7 @@ end
                 "Ops",
                 vec![
                     Statement::let_abstraction(
-                        "add",
+                        Name::plain("add"),
                         vec![Pattern::ident("x"), Pattern::ident("y")],
                         Expr::binop_with(
                             BinOp::Sum,
@@ -2615,7 +2724,7 @@ end
                         )
                     ),
                     Statement::let_abstraction(
-                        "sub",
+                        Name::plain("sub"),
                         vec![Pattern::ident("x"), Pattern::ident("y")],
                         Expr::binop_with(
                             BinOp::Sub,
@@ -2664,7 +2773,7 @@ let add x y = x + y;
             Ok(Statement::with_doc(
                 "(+) operator wrapper".to_owned(),
                 Statement::let_abstraction(
-                    "add",
+                    Name::plain("add"),
                     vec![Pattern::ident("x"), Pattern::ident("y")],
                     Expr::binop_with(
                         BinOp::Sum,

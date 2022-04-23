@@ -1,0 +1,19 @@
+// Module for natural numbers.
+//
+// Natural in Kaffee stands for unsigned pointer-sized integer type.
+module Nat = struct
+    // @plus stands for spelling of binary `+` operator literal.
+    //
+    // When this definition is in scope, `+` resolves to call to this function.
+    let @plus x y = NatInternal.add x y;
+end
+
+
+// Examples of different type definitions in Kaffee.
+module Collections = struct
+    // Generic pair
+    type ('a, 'b) pair = 'a * 'b;
+
+    // Type alias for array index
+    type idx = nat;
+end
