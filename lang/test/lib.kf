@@ -12,7 +12,7 @@ end
 // Examples of different type definitions in Kaffee.
 module Collections = struct
     // Generic pair
-    type ('a, 'b) pair = 'a * 'b;
+    type pair ('a, 'b) = 'a * 'b;
 
     // Type alias for array index
     type idx = nat;

@@ -7,7 +7,7 @@ fn main() -> std::io::Result<()> {
     let mut src = String::new();
     file.read_to_string(&mut src)?;
 
-    let ast = parser::Ast::parse_expect(&src);
+    let ast = parser::ast::Ast::parse_expect(&src);
     println!("{ast:#?}");
 
     Ok(())
