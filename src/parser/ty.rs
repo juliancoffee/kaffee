@@ -84,8 +84,6 @@ fn ty() -> impl SubParser<Spanned<Type>> {
 #[derive(Debug, PartialEq, Clone)]
 pub enum TypeBind {
     Bound(Spanned<Name>),
-    // TODO: make abstraction use Name as well to be able to create spells for
-    // list literals.
     Abstraction(Spanned<Name>, Vec<Spanned<String>>),
 }
 
@@ -126,20 +124,64 @@ fn type_bind() -> impl SubParser<TypeBind> {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub enum TypeDef {
-    Alias(TypeBind, Spanned<Type>),
+pub enum Variant {
+    Case(Spanned<String>, Spanned<Type>),
+    Tag(Spanned<String>),
 }
 
-#[allow(clippy::let_and_return)]
-pub(super) fn typedef() -> impl SubParser<TypeDef> {
-    let alias = just(Token::Type)
+impl Variant {
+    #[cfg(test)]
+    fn tag(name: &str) -> Self {
+        Self::Tag(name.to_owned())
+    }
+
+    #[cfg(test)]
+    fn case(name: &str, def: Type) -> Self {
+        Self::Case(name.to_owned(), def)
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum TypeDef {
+    Alias(TypeBind, Spanned<Type>),
+    Enum(TypeBind, Vec<Variant>),
+}
+
+fn alias() -> impl SubParser<TypeDef> {
+    just(Token::Type)
         .ignore_then(type_bind())
         .then_ignore(just(Token::Is))
         .then(ty())
         .then_ignore(just(Token::Semicolon))
-        .map(|(bind, ty)| TypeDef::Alias(bind, ty));
+        .map(|(bind, ty)| TypeDef::Alias(bind, ty))
+}
 
-    alias
+fn variant() -> impl SubParser<Variant> {
+    let tag = select! {
+        Token::Ident(i) => i,
+    }
+    .map_with_span(spanned);
+
+    choice((
+        tag.then_ignore(just(Token::Of))
+            .then(ty())
+            .map(|(tag, def)| Variant::Case(tag, def)),
+        tag.map(Variant::Tag),
+    ))
+}
+
+fn variants() -> impl SubParser<TypeDef> {
+    just(Token::Type)
+        .ignore_then(type_bind())
+        .then_ignore(just(Token::Is))
+        .then(variant().separated_by(just(Token::Either)))
+        .then_ignore(just(Token::Semicolon))
+        .map(|(bind, variants)| TypeDef::Enum(bind, variants))
+}
+
+#[allow(clippy::let_and_return)]
+pub(super) fn typedef() -> impl SubParser<TypeDef> {
+    choice((alias(), variants()))
 }
 
 #[cfg(test)]
@@ -266,5 +308,50 @@ mod tests {
                 ),
             ))
         );
+    }
+
+    #[test]
+    fn parse_type_enum_tags() {
+        let src = "type colour = Black | White;";
+
+        assert_eq!(
+            parse_typedef(src),
+            Ok(TypeDef::Enum(
+                TypeBind::Bound(Name::plain("colour")),
+                vec![Variant::tag("Black"), Variant::tag("White")]
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_type_enum() {
+        let src = "type id = Num of nat | Name of string;";
+
+        assert_eq!(
+            parse_typedef(src),
+            Ok(TypeDef::Enum(
+                TypeBind::Bound(Name::plain("id")),
+                vec![
+                    Variant::case("Num", Type::ident("nat")),
+                    Variant::case("Name", Type::ident("string")),
+                ]
+            ))
+        )
+    }
+
+    #[test]
+    fn parse_type_option() {
+        let src = "type option 'a = Some of 'a | None;";
+
+        assert_eq!(
+            parse_typedef(src),
+            Ok(TypeDef::Enum(
+                TypeBind::abstraction(Name::plain("option"), vec!["a"]),
+                vec![
+                    Variant::case("Some", Type::var("a")),
+                    Variant::tag("None"),
+                ]
+            ))
+        )
     }
 }
