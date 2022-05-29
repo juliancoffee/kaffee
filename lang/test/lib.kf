@@ -2,10 +2,18 @@
 //
 // Natural in Kaffee stands for unsigned pointer-sized integer type.
 module Nat = struct
+    type t = Internal.Nat.t;
+    let add = Internal.Nat.add;
+
+    // @integer stands for spelling of integer literal.
+    //
+    // When this defition is in scope, integer literals resolve to this type.
+    type @integer = t; 
+
     // @plus stands for spelling of binary `+` operator literal.
     //
     // When this definition is in scope, `+` resolves to call to this function.
-    let @plus x y = NatInternal.add x y;
+    let @plus x y = add x y;
 end
 
 
@@ -15,5 +23,5 @@ module Collections = struct
     type pair ('a, 'b) = 'a * 'b;
 
     // Type alias for array index
-    type idx = nat;
+    type idx = Nat.t;
 end

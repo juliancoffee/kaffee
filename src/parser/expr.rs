@@ -5,11 +5,11 @@ use super::Name;
 
 use super::{
     bind::{bind, Bind},
-    foldl_binops, grouping,
+    common::{foldl_binops, from_module, grouping, tuple_like},
     lex::{Op, Token},
     lookup,
     pattern::{pattern, Pattern},
-    spanned, transfer_span, tuple_like, unspan, Spanned,
+    spanned, transfer_span, unspan, Spanned,
 };
 
 pub(super) trait ExprParser:
@@ -217,19 +217,16 @@ fn tuple<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
 }
 
 // Parses module subscription
-fn from_module<P: ExprParser + Clone>(term: P) -> impl ExprParser + Clone {
-    select! {Token::Ident(m) => m}
-        .map_with_span(spanned)
-        .then_ignore(just(Token::Dot))
-        .then(term)
-        .map(|(mod_name, expr)| Expr::from_module(mod_name, expr))
-        .map_with_span(spanned)
+fn imported<P: ExprParser + Clone + 'static>(
+    term: P,
+) -> impl ExprParser + Clone {
+    from_module(term, Expr::from_module)
 }
 
 // Parses list expression
 fn list<P: ExprParser + 'static>(term: P) -> impl ExprParser {
     recursive(|sublist| {
-        let element = term.or(sublist.clone());
+        let element = term.or(sublist);
 
         element
             .repeated()
@@ -392,7 +389,7 @@ pub(super) fn expression() -> impl ExprParser + Clone {
         #[cfg(debug_assertions)]
         let term = term.boxed();
         // module subscription (Mod.e)
-        let from_module = from_module(term.clone());
+        let from_module = imported(term.clone());
         // application (e e e)
         let app = app(from_module.or(term));
         // unary negation

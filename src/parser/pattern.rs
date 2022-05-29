@@ -1,6 +1,9 @@
 use chumsky::prelude::*;
 
-use super::{grouping, spanned, tuple_like, Spanned, SubParser, Token};
+use super::{
+    common::{grouping, tuple_like},
+    spanned, Spanned, SubParser, Token,
+};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Pattern {

@@ -1,15 +1,16 @@
 use chumsky::prelude::*;
 
 use super::{
-    grouping,
+    common::{from_module, grouping, tuple_like},
     lex::{Op, Token},
-    spanned, tuple_like, Name, Spanned, SubParser,
+    spanned, Name, Spanned, SubParser,
 };
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Type {
     Ident(String),
     Var(String),
+    FromModule(Spanned<String>, Box<Spanned<Self>>),
     Product(Vec<Spanned<Self>>),
     App(Box<Spanned<Self>>, Vec<Spanned<Self>>),
 }
@@ -30,6 +31,13 @@ impl Type {
         args: Vec<Spanned<Self>>,
     ) -> Self {
         Self::App(Box::new(constructor), args)
+    }
+
+    pub(super) fn from_module(
+        mod_name: Spanned<String>,
+        t: Spanned<Self>,
+    ) -> Self {
+        Self::FromModule(mod_name, Box::new(t))
     }
 }
 
@@ -61,6 +69,12 @@ fn type_app<P: SubParser<Spanned<Type>> + Clone + 'static>(
     })
 }
 
+fn imported<P: SubParser<Spanned<Type>> + Clone + 'static>(
+    type_expr: P,
+) -> impl SubParser<Spanned<Type>> + Clone {
+    from_module(type_expr, Type::from_module)
+}
+
 fn ty() -> impl SubParser<Spanned<Type>> {
     recursive(|type_expr| {
         let ident = select! {
@@ -72,12 +86,17 @@ fn ty() -> impl SubParser<Spanned<Type>> {
 
         let atom = ident.or(grouping);
 
-        // Type application ('a constructor)
+        // Type application (constructor 'a)
         let app = type_app(atom.clone());
+        let complex = app.or(atom.clone());
         // Type product ('a * 'b)
-        let product = product_type(app.clone().or(atom.clone()));
+        let product = product_type(complex.clone());
+        let complex = product.or(complex);
+        // Type from module (Mod.t)
+        let from_module = imported(complex.clone());
+        let complex = from_module.or(complex);
 
-        product.or(app).or(atom)
+        complex.or(atom)
     })
 }
 
@@ -320,7 +339,7 @@ mod tests {
                 TypeBind::Bound(Name::plain("colour")),
                 vec![Variant::tag("Black"), Variant::tag("White")]
             ))
-        )
+        );
     }
 
     #[test]
@@ -336,7 +355,7 @@ mod tests {
                     Variant::case("Name", Type::ident("string")),
                 ]
             ))
-        )
+        );
     }
 
     #[test]
@@ -352,6 +371,35 @@ mod tests {
                     Variant::tag("None"),
                 ]
             ))
-        )
+        );
+    }
+
+    #[test]
+    fn parse_type_from_module() {
+        let src = "type @integer = Int64Internal.t;";
+
+        assert_eq!(
+            parse_typedef(src),
+            Ok(TypeDef::Alias(
+                TypeBind::Bound(Name::spell("integer")),
+                Type::from_module("Int64Internal".to_owned(), Type::ident("t")),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_type_nested_module() {
+        let src = "type target = X.Y.t;";
+
+        assert_eq!(
+            parse_typedef(src),
+            Ok(TypeDef::Alias(
+                TypeBind::Bound(Name::plain("target")),
+                Type::from_module(
+                    "X".to_owned(),
+                    Type::from_module("Y".to_owned(), Type::ident("t")),
+                ),
+            ))
+        );
     }
 }

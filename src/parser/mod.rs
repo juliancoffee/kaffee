@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod bind;
+pub mod common;
 pub mod expr;
 pub mod lex;
 pub mod pattern;
@@ -98,49 +99,6 @@ fn lookup<T>(s: &Spanned<T>) -> &T {
 #[cfg(test)]
 fn unspan<T>(s: Spanned<T>) -> T {
     s
-}
-
-/* * * * * * * * * * * * * *
- * Useful generic parsers  *
- * * * * * * * * * * * * * */
-
-// Parses enclosed item
-//
-// Result in whatever item were inside parens, so basically works by removing
-// parens.
-fn grouping<I, P: SubParser<I> + Clone>(expr: P) -> impl SubParser<I> + Clone {
-    expr.delimited_by(just(Token::OpenParen), just(Token::CloseParen))
-}
-
-// Parses comma separated items delimited by parens
-fn tuple_like<S, O, F, P>(item: P, f: F) -> impl SubParser<O> + Clone
-where
-    F: Fn(Vec<S>) -> O + Clone,
-    P: SubParser<S> + Clone,
-{
-    item.separated_by(just(Token::Comma))
-        .delimited_by(just(Token::OpenParen), just(Token::CloseParen))
-        .collect::<Vec<_>>()
-        .map(f)
-}
-
-// Parses `a op b op .. op z` chains
-//
-// If none of `op` were found, just return first parsed item.
-//
-// `op` may be multiple operators, but remember that each precedence step
-// should be separate.
-fn foldl_binops<T, OP, TP, F>(
-    item: TP,
-    op: OP,
-    f: F,
-) -> impl SubParser<T> + Clone
-where
-    TP: SubParser<T> + Clone,
-    OP: SubParser<Token> + Clone,
-    F: Fn(T, (Token, T)) -> T + Clone,
-{
-    item.clone().then(op.then(item).repeated()).foldl(f)
 }
 
 #[derive(Debug, PartialEq, Clone)]
