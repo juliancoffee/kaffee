@@ -5,7 +5,7 @@ use super::Name;
 
 use super::{
     bind::{bind, Bind},
-    common::{foldl_binops, from_module, grouping, tuple_like},
+    common::{foldl_binops, from_module, grouping, tuple_like, RecordEntry},
     lex::{Op, Token},
     lookup,
     pattern::{pattern, Pattern},
@@ -51,6 +51,7 @@ pub enum Expr {
     // Collections
     List(Vec<Spanned<Self>>),
     Tuple(Vec<Spanned<Self>>),
+    Record(Vec<RecordEntry<Self>>),
     // Complex
     Unary(UnOp, Box<Spanned<Self>>),
     BinOp(BinOp, Box<Spanned<Self>>, Box<Spanned<Self>>),
@@ -237,6 +238,20 @@ fn list<P: ExprParser + 'static>(term: P) -> impl ExprParser {
     })
 }
 
+// Parses record expression
+fn record<P: ExprParser>(term: P) -> impl ExprParser {
+    let entry = select! {Token::Ident(field) => field}
+        .map_with_span(spanned)
+        .then_ignore(just(Token::Colon))
+        .then(term);
+
+    entry
+        .separated_by(just(Token::Comma))
+        .delimited_by(just(Token::OpenBrace), just(Token::CloseBrace))
+        .map(Expr::Record)
+        .map_with_span(spanned)
+}
+
 // Parses application `e e e`
 //
 // Returns expression 'as is' if none of applications were found
@@ -379,8 +394,12 @@ pub(super) fn expression() -> impl ExprParser + Clone {
         let literal = literal.map_with_span(spanned);
 
         // literal | grouping | tuple
-        let atom =
-            choice((literal, grouping(expr.clone()), tuple(expr.clone())));
+        let atom = choice((
+            literal,
+            grouping(expr.clone()),
+            tuple(expr.clone()),
+            record(expr.clone()),
+        ));
         #[cfg(debug_assertions)]
         let atom = atom.boxed();
         // list
@@ -522,6 +541,60 @@ mod tests {
         assert_eq!(
             parse_expr(src),
             Ok(Expr::List(vec![Expr::Int(5), Expr::Int(25)]))
+        );
+    }
+
+    #[test]
+    fn parse_record_expr() {
+        let src = "{x: 5, y: 8}";
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::Record(vec![
+                ("x".to_owned(), Expr::Int(5)),
+                ("y".to_owned(), Expr::Int(8)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_nested_record_expr() {
+        let src = "{yay: {x: 5, y: 5}, yoy: {x: 7, y: 0}}";
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::Record(vec![
+                (
+                    "yay".to_owned(),
+                    Expr::Record(vec![
+                        ("x".to_owned(), Expr::Int(5)),
+                        ("y".to_owned(), Expr::Int(5)),
+                    ])
+                ),
+                (
+                    "yoy".to_owned(),
+                    Expr::Record(vec![
+                        ("x".to_owned(), Expr::Int(7)),
+                        ("y".to_owned(), Expr::Int(0)),
+                    ])
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_record_from_module_expr() {
+        let src = "Date.{day: 32, month: 44}";
+
+        assert_eq!(
+            parse_expr(src),
+            Ok(Expr::from_module(
+                "Date".to_owned(),
+                Expr::Record(vec![
+                    ("day".to_owned(), Expr::Int(32)),
+                    ("month".to_owned(), Expr::Int(44)),
+                ]),
+            ))
         );
     }
 

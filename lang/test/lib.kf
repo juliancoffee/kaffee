@@ -8,7 +8,7 @@ module Nat = struct
     // @integer stands for spelling of integer literal.
     //
     // When this defition is in scope, integer literals resolve to this type.
-    type @integer = t; 
+    type @integer = t;
 
     // @plus stands for spelling of binary `+` operator literal.
     //

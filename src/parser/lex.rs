@@ -54,6 +54,7 @@ pub(super) enum Token {
     Of,
     Is,
     In,
+    Colon,
     Dot,
     // Finishers
     Semicolon,
@@ -143,6 +144,7 @@ pub(super) fn lexer(
         just('_').to(Token::Wildcard),
         just('=').to(Token::Is),
         just('.').to(Token::Dot),
+        just(':').to(Token::Colon),
         just(';').to(Token::Semicolon),
         just(',').to(Token::Comma),
         just('|').to(Token::Either),
@@ -227,6 +229,30 @@ mod tests {
                 Token::Int("5".to_owned()),
                 Token::Int("25".to_owned()),
                 Token::CloseBracket,
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_record_expr() {
+        let src = "{year: 2022, month: 2, day: 24}";
+
+        assert_eq!(
+            remove_spans(lexer().parse(src)),
+            Ok(vec![
+                Token::OpenBrace,
+                Token::Ident("year".to_owned()),
+                Token::Colon,
+                Token::Int("2022".to_owned()),
+                Token::Comma,
+                Token::Ident("month".to_owned()),
+                Token::Colon,
+                Token::Int("2".to_owned()),
+                Token::Comma,
+                Token::Ident("day".to_owned()),
+                Token::Colon,
+                Token::Int("24".to_owned()),
+                Token::CloseBrace,
             ])
         );
     }
@@ -501,7 +527,7 @@ in x + y
 
     #[test]
     fn tokenize_type_record_stmt() {
-        let src = "type date = {year of int, month of int, day of int}";
+        let src = "type date = {year: int, month: int, day: int}";
         assert_eq!(
             remove_spans(lexer().parse(src)),
             Ok(vec![
@@ -510,15 +536,15 @@ in x + y
                 Token::Is,
                 Token::OpenBrace,
                 Token::Ident("year".to_owned()),
-                Token::Of,
+                Token::Colon,
                 Token::Ident("int".to_owned()),
                 Token::Comma,
                 Token::Ident("month".to_owned()),
-                Token::Of,
+                Token::Colon,
                 Token::Ident("int".to_owned()),
                 Token::Comma,
                 Token::Ident("day".to_owned()),
-                Token::Of,
+                Token::Colon,
                 Token::Ident("int".to_owned()),
                 Token::CloseBrace,
             ])
